@@ -82,6 +82,45 @@ class ChatServer:
             self.clients[username] = {"password": password, "addr": None, "socket": None}
         print(f"[服务器] 已加载 {len(rows)} 个已注册用户")
 
+    def _get_conversations_for_user(self, username):
+        """返回某用户参与过的所有私聊对象列表（按最近消息时间降序）"""
+        rows = self.conn.execute(
+            "SELECT DISTINCT chat_key FROM messages WHERE chat_key != 'public'"
+        ).fetchall()
+        partners = []
+        for (key,) in rows:
+            users = key.split(":")
+            if username in users:
+                partner = users[0] if users[1] == username else users[1]
+                last = self.conn.execute(
+                    "SELECT timestamp FROM messages WHERE chat_key = ? ORDER BY id DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                last_ts = last[0] if last else ""
+                partners.append((partner, last_ts))
+        partners.sort(key=lambda x: x[1], reverse=True)
+        return [p[0] for p in partners]
+
+    def _add_message_db(self, key, sender, content):
+        """插入消息到 SQLite 并淘汰旧消息，返回带 timestamp 的 msg dict"""
+        msg = {
+            "sender": sender,
+            "content": content,
+            "timestamp": now_iso(),
+        }
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO messages (chat_key, sender, content, timestamp) VALUES (?, ?, ?, ?)",
+                (key, sender, content, msg["timestamp"]),
+            )
+            self.conn.execute("""
+                DELETE FROM messages WHERE chat_key = ? AND id NOT IN (
+                    SELECT id FROM messages WHERE chat_key = ? ORDER BY id DESC LIMIT ?
+                )
+            """, (key, key, MAX_MESSAGES_PER_CHAT))
+            self.conn.commit()
+        return msg
+
     # ========================
     #  服务器启动
     # ========================
@@ -120,8 +159,7 @@ class ChatServer:
                         pass
         if self.server_socket:
             self.server_socket.close()
-        self._save_users()
-        self._save_messages()                              # 新增
+        self.conn.close()
         print("[服务器] 服务器已关闭")
 
     # ========================
@@ -210,8 +248,14 @@ class ChatServer:
                     make_response(STATUS_ERROR, "用户名已存在").encode(ENCODING)
                 )
                 return None
+            # 写入 SQLite
+            self.conn.execute(
+                "INSERT INTO users (username, password) VALUES (?, ?)",
+                (username, password),
+            )
+            self.conn.commit()
+            # 加入运行时字典
             self.clients[username] = {"password": password, "addr": None, "socket": None}
-            self._save_users()
 
         print(f"{_ts()} _handle_register: 注册成功 '{username}' → 发送响应")
         client_socket.sendall(
@@ -242,7 +286,9 @@ class ChatServer:
                     make_response(STATUS_ERROR, "用户不存在，请先注册").encode(ENCODING)
                 )
                 return None
-            if self.clients[username]["password"] != password:
+            # 密码验证（首次登录用缓存，重连时密码仍保留在 dict 中）
+            stored_pw = self.clients[username].get("password")
+            if stored_pw is not None and stored_pw != password:
                 print(f"{_ts()} _handle_login: 密码错误 → 返回错误")
                 client_socket.sendall(
                     make_response(STATUS_ERROR, "密码错误").encode(ENCODING)
@@ -259,15 +305,22 @@ class ChatServer:
             self.clients[username]["addr"] = addr
             self.clients[username]["socket"] = client_socket
 
-        print(f"{_ts()} _handle_login: 登录成功 '{username}' → 发送响应")
-        public_history = self.messages.get("public", [])[-MAX_HISTORY:]
+        # 查询公聊历史
+        rows = self.conn.execute(
+            "SELECT sender, content, timestamp FROM messages "
+            "WHERE chat_key = 'public' ORDER BY id DESC LIMIT ?",
+            (MAX_HISTORY,),
+        ).fetchall()
+        public_history = [
+            {"sender": r[0], "content": r[1], "timestamp": r[2]}
+            for r in reversed(rows)
+        ]
         conversations = self._get_conversations_for_user(username)
         login_resp = make_message(
             TYPE_RESPONSE, status=STATUS_OK, message="登录成功",
             public_history=public_history, conversations=conversations,
         )
         client_socket.sendall(login_resp.encode(ENCODING))
-        print(f"{_ts()} _handle_login: 响应已发送, 广播上线通知")
 
         # 广播上线通知
         self.broadcast(f"{username} 加入了聊天室", system=True, exclude=username)
@@ -321,7 +374,7 @@ class ChatServer:
         if not content.strip():
             return
         # 保存到 messages
-        saved = self._add_message("public", current_user, content)
+        saved = self._add_message_db("public", current_user, content)
         full_msg = make_message(
             TYPE_BROADCAST, content=content, sender=current_user,
             timestamp=saved["timestamp"],
@@ -371,7 +424,7 @@ class ChatServer:
 
         # 保存消息
         key = conversation_key(current_user, target)
-        saved = self._add_message(key, current_user, content)
+        saved = self._add_message_db(key, current_user, content)
 
         ok = self.private_message(target, content, current_user)
         if ok:
@@ -402,11 +455,18 @@ class ChatServer:
         if not current_user:
             return
         target = msg.get("target", "public")
-        # 如果是私聊会话，用 conversation_key 构造真正的 key
         if target != "public":
             target = conversation_key(current_user, target)
         with self.lock:
-            msgs = self.messages.get(target, [])[-MAX_HISTORY:]
+            rows = self.conn.execute(
+                "SELECT sender, content, timestamp FROM messages "
+                "WHERE chat_key = ? ORDER BY id DESC LIMIT ?",
+                (target, MAX_HISTORY),
+            ).fetchall()
+        msgs = [
+            {"sender": r[0], "content": r[1], "timestamp": r[2]}
+            for r in reversed(rows)
+        ]
         client_socket.sendall(
             make_message(TYPE_HISTORY, target=target, messages=msgs).encode(ENCODING)
         )
