@@ -12,6 +12,7 @@ from tkinter import ttk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
 from tkinter import messagebox, simpledialog, filedialog
+from PIL import Image, ImageTk
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
@@ -21,6 +22,7 @@ from common import (
     TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
     TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
     TYPE_FILE_SEND, TYPE_FILE_NOTIFY, TYPE_FILE_DOWNLOAD,
+    TYPE_ADD_MEMBER, TYPE_SEARCH_USERS, TYPE_ADD_CONTACT,
     FILE_PORT, FILE_CHUNK,
     STATUS_OK, STATUS_ERROR,
     make_message, parse_message, conversation_key, group_key,
@@ -163,6 +165,7 @@ class LoginWindow:
                 self._login_public_history = resp.get("public_history", [])
                 self._login_conversations = resp.get("conversations", [])
                 self._login_groups = resp.get("groups", [])
+                self._login_contacts = resp.get("contacts", [])
                 self.root.after(0, self.root.destroy)
             else:
                 msg = resp.get("message", "") if resp else err
@@ -213,13 +216,18 @@ class LoginWindow:
 #  聊天主窗口
 # ============================
 class ChatWindow:
-    def __init__(self, socket_conn, username, public_history=None, conversations=None, groups=None):
+    def __init__(self, socket_conn, username, public_history=None, conversations=None, groups=None, contacts=None):
         self.socket = socket_conn
         self.username = username
         self.running = True
         self.current_chat = "public"
         self.online_users = set()
         self._conv_partners = list(conversations) if conversations else []
+        self._contacts = list(contacts) if contacts else []
+        # 合并服务端联系人到会话列表（去重）
+        for c in self._contacts:
+            if c not in self._conv_partners:
+                self._conv_partners.append(c)
         self._groups = groups or []
         self._pending_upload = None
 
@@ -304,6 +312,9 @@ class ChatWindow:
         tk.Button(btn_frame, text="+ 创建群", font=(FONT_FAMILY, 9),
                  bg=LEFT_BG, relief=tk.GROOVE, cursor="hand2",
                  command=self._create_group_dialog).pack(fill="x")
+        tk.Button(btn_frame, text="+ 添加好友", font=(FONT_FAMILY, 9),
+                 bg=LEFT_BG, relief=tk.GROOVE, cursor="hand2",
+                 command=self._search_users_dialog).pack(fill="x", pady=(2, 0))
 
     def _build_right_panel(self):
         self.right_frame = tk.Frame(self.paned, bg=BG_COLOR)
@@ -552,6 +563,7 @@ class ChatWindow:
             if not grp:
                 return
             self._tree_menu.add_command(label="查看成员", command=lambda g=gid: self._show_group_members(g))
+            self._tree_menu.add_command(label="添加成员", command=lambda g=gid: self._add_member_dialog(g))
             self._tree_menu.add_command(label="退出群", command=lambda g=gid: self._leave_group(g))
             if grp.get("created_by") == self.username:
                 self._tree_menu.add_command(label="解散群", command=lambda g=gid: self._delete_group(g))
@@ -577,6 +589,100 @@ class ChatWindow:
             )
         except Exception:
             pass
+
+    def _add_member_dialog(self, gid):
+        username = simpledialog.askstring("添加成员", "请输入要添加的用户名:", parent=self.root)
+        if not username or not username.strip():
+            return
+        try:
+            self.socket.sendall(
+                make_message(TYPE_ADD_MEMBER, group_id=gid, target=username.strip()).encode(ENCODING)
+            )
+        except Exception as e:
+            self._add_bubble("[系统]", f"添加成员失败: {e}", "")
+
+    def _search_users_dialog(self):
+        """弹出搜索好友对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("添加好友")
+        dialog.geometry("300x350")
+        dialog.resizable(False, False)
+        dialog.configure(bg=BG_COLOR)
+
+        # 搜索框
+        frm_top = tk.Frame(dialog, bg=BG_COLOR)
+        frm_top.pack(fill="x", padx=10, pady=(10, 4))
+        entry = tk.Entry(frm_top, font=(FONT_FAMILY, 10))
+        entry.pack(side="left", fill="x", expand=True, ipady=2)
+
+        # 结果列表
+        list_frame = tk.Frame(dialog, bg=WHITE)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        listbox = tk.Listbox(list_frame, font=(FONT_FAMILY, 10), bg=WHITE,
+                            selectmode=tk.SINGLE, relief=tk.FLAT)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(list_frame, command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.config(yscrollcommand=scrollbar.set)
+
+        def do_search(*args):
+            query = entry.get().strip()
+            if not query:
+                return
+            try:
+                self.socket.sendall(
+                    make_message(TYPE_SEARCH_USERS, query=query).encode(ENCODING)
+                )
+            except Exception:
+                pass
+
+        entry.bind("<Return>", do_search)
+
+        # 搜索结果临时存储
+        result_users = []
+
+        def on_search_result(users):
+            result_users.clear()
+            result_users.extend(users)
+            listbox.delete(0, tk.END)
+            for u in users:
+                listbox.insert(tk.END, f"  {u}")
+            if not users:
+                listbox.insert(tk.END, "  无匹配用户")
+
+        def add_selected():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            if idx < len(result_users):
+                target = result_users[idx]
+                try:
+                    self.socket.sendall(
+                        make_message(TYPE_ADD_CONTACT, username=target).encode(ENCODING)
+                    )
+                except Exception as e:
+                    self._add_bubble("[系统]", f"添加失败: {e}", "")
+
+        self._on_search_result = on_search_result
+
+        # 按钮
+        btn_frame = tk.Frame(dialog, bg=BG_COLOR)
+        btn_frame.pack(fill="x", padx=10, pady=(4, 10))
+        tk.Button(btn_frame, text="搜索", command=do_search,
+                 font=(FONT_FAMILY, 9), bg="#07C160", fg=WHITE,
+                 relief=tk.FLAT, padx=12).pack(side="left")
+        tk.Button(btn_frame, text="添加好友", command=add_selected,
+                 font=(FONT_FAMILY, 9), bg=WHITE, relief=tk.GROOVE,
+                 padx=12).pack(side="right")
+
+        entry.focus_set()
+        # 居中
+        dialog.update_idletasks()
+        w, h = dialog.winfo_width(), dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() - w) // 2
+        y = (dialog.winfo_screenheight() - h) // 2
+        dialog.geometry(f"+{x}+{y}")
 
     def _leave_group(self, gid):
         try:
@@ -729,12 +835,16 @@ class ChatWindow:
             self._update_users(msg.get("users", []))
 
         elif msg_type == TYPE_RESPONSE:
-            # 群创建/加入响应
+            # 群创建/加入/被邀请响应
             group_data = msg.get("group")
             if group_data:
+                notify_msg = msg.get("message", "")
                 exist = [g for g in self._groups if g['id'] == group_data['id']]
                 if not exist:
                     self._groups.append(group_data)
+                    # 显示群通知消息（被邀请时让用户看到）
+                    if notify_msg:
+                        self._add_bubble("[系统]", notify_msg, "")
                 self._rebuild_conv_list()
                 self.root.after(100, lambda gid=group_data['id']: self._switch_to(f"group:{gid}"))
             # 文件发送响应
@@ -742,6 +852,21 @@ class ChatWindow:
             if file_id and self._pending_upload:
                 self._do_file_upload(file_id, self._pending_upload)
                 self._pending_upload = None
+            # 添加好友响应
+            contact = msg.get("contact")
+            if contact and contact not in self._conv_partners:
+                self._conv_partners.append(contact)
+                self._contacts.append(contact)
+                self._rebuild_conv_list()
+                notify_msg = msg.get("message", "")
+                if notify_msg:
+                    self._add_bubble("[系统]", notify_msg, "")
+
+        elif msg_type == TYPE_SEARCH_USERS:
+            # 搜索结果回调到对话框
+            cb = getattr(self, '_on_search_result', None)
+            if cb:
+                self.root.after(0, lambda: cb(msg.get("users", [])))
 
         elif msg_type == TYPE_GROUP_USERS:
             users = msg.get("users", [])
@@ -763,9 +888,13 @@ class ChatWindow:
             fsize = msg.get("size", 0)
             file_id = msg.get("file_id", "")
             sender = msg.get("sender", "")
-            self.root.after(0, lambda: self._render_file_card(
-                sender, filename, fsize, file_id, False,
-            ))
+            if self._is_image(filename):
+                # 图片自动下载并内联预览
+                self._auto_download_image(file_id, filename, sender)
+            else:
+                self.root.after(0, lambda: self._render_file_card(
+                    sender, filename, fsize, file_id, False,
+                ))
 
     def _show_emoji_panel(self):
         """弹出 emoji 选择面板"""
@@ -814,6 +943,10 @@ class ChatWindow:
         filename = os.path.basename(filepath)
         fsize = os.path.getsize(filepath)
 
+        # 图片立即内联预览（不等上传完成）
+        if self._is_image(filename):
+            self._render_image_bubble(self.username, filepath, True)
+
         receiver = self.current_chat if not self.current_chat.startswith("group:") and self.current_chat != "public" else self.username
         try:
             self.socket.sendall(
@@ -839,47 +972,121 @@ class ChatWindow:
                             break
                         fs.sendall(chunk)
                 fs.close()
-                self.root.after(0, lambda: self._render_file_card(
-                    self.username, info["filename"], info["fsize"], file_id, True,
-                ))
+                # 图片预览已在 _send_file 中显示，仅非图片显示文件卡片
+                if not self._is_image(info["filename"]):
+                    self.root.after(0, lambda: self._render_file_card(
+                        self.username, info["filename"], info["fsize"], file_id, True,
+                    ))
             except Exception as e:
                 self._add_bubble("[系统]", f"上传文件失败: {e}", "")
         threading.Thread(target=upload, daemon=True).start()
+
+    @staticmethod
+    def _file_icon(filename):
+        ext = os.path.splitext(filename)[1].lower()
+        return {
+            '.jpg': '🖼️', '.jpeg': '🖼️', '.png': '🖼️', '.gif': '🖼️', '.bmp': '🖼️', '.webp': '🖼️', '.svg': '🖼️',
+            '.mp4': '🎬', '.avi': '🎬', '.mov': '🎬', '.mkv': '🎬', '.wmv': '🎬',
+            '.mp3': '🎵', '.wav': '🎵', '.flac': '🎵', '.aac': '🎵', '.ogg': '🎵',
+            '.pdf': '📕',
+            '.zip': '📦', '.rar': '📦', '.7z': '📦', '.tar': '📦', '.gz': '📦',
+            '.doc': '📝', '.docx': '📝', '.txt': '📝', '.md': '📝',
+            '.xls': '📊', '.xlsx': '📊', '.csv': '📊',
+            '.ppt': '📽️', '.pptx': '📽️',
+            '.py': '💻', '.js': '💻', '.ts': '💻', '.html': '💻', '.css': '💻', '.java': '💻', '.cpp': '💻', '.c': '💻',
+            '.exe': '⚙️', '.msi': '⚙️', '.dmg': '⚙️', '.apk': '⚙️',
+        }.get(ext, '📄')
+
+    @staticmethod
+    def _format_size(fsize):
+        if fsize < 1024:
+            return f"{fsize} B"
+        elif fsize < 1024 * 1024:
+            return f"{fsize / 1024:.1f} KB"
+        else:
+            return f"{fsize / 1024 / 1024:.1f} MB"
+
+    @staticmethod
+    def _is_image(filename):
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')
+
+    @staticmethod
+    def _create_thumbnail(filepath, max_size=(240, 240)):
+        """生成缩略图，返回缩略图路径；失败返回 None"""
+        try:
+            img = Image.open(filepath)
+            img.thumbnail(max_size, Image.LANCZOS)
+            os.makedirs("downloads/.thumbnails", exist_ok=True)
+            thumb_name = os.path.basename(filepath) + ".thumb.png"
+            thumb_path = os.path.join("downloads", ".thumbnails", thumb_name)
+            if img.mode == 'RGBA' or img.mode == 'P':
+                img = img.convert('RGBA')
+                img.save(thumb_path, 'PNG')
+            else:
+                img.save(thumb_path, 'JPEG', quality=85)
+            return thumb_path
+        except Exception:
+            return None
 
     def _render_file_card(self, sender, filename, fsize, file_id, is_sender):
         """渲染文件卡片气泡"""
         is_me = (sender == self.username)
         bubble_bg = GREEN_BUBBLE if is_me else WHITE
-        size_str = f"{fsize:,} B" if fsize < 1024 else f"{fsize/1024:.1f} KB"
+        icon = self._file_icon(filename)
+        size_str = self._format_size(fsize)
 
         outer = tk.Frame(self.bubble_frame, bg=BG_COLOR)
         if is_me:
-            outer.pack(anchor="e", pady=1, padx=(40, 6))
+            outer.pack(anchor="e", pady=2, padx=(40, 8))
         else:
-            outer.pack(anchor="w", pady=1, padx=(6, 40))
+            outer.pack(anchor="w", pady=2, padx=(8, 40))
 
-        inner = tk.Frame(outer, bg=bubble_bg, padx=10, pady=6)
+        # 发送者名（接收方显示）
+        if not is_me:
+            tk.Label(outer, text=sender, font=self.time_font,
+                    fg=GRAY, bg=BG_COLOR, anchor="w").pack(anchor="w", padx=(4, 0))
+
+        inner = tk.Frame(outer, bg=bubble_bg, padx=12, pady=8)
         inner.pack()
 
-        tk.Label(inner, text=f"📄 {filename}", font=self.bubble_font,
-                bg=bubble_bg, fg=BLACK).pack(anchor="w")
-        tk.Label(inner, text=size_str, font=self.time_font,
-                bg=bubble_bg, fg=GRAY).pack(anchor="w")
+        # 图标 + 文件信息
+        info_row = tk.Frame(inner, bg=bubble_bg)
+        info_row.pack(fill="x")
 
+        tk.Label(info_row, text=icon, font=(FONT_FAMILY, 20),
+                bg=bubble_bg).pack(side="left", padx=(0, 8))
+
+        text_col = tk.Frame(info_row, bg=bubble_bg)
+        text_col.pack(side="left", fill="x", expand=True)
+
+        tk.Label(text_col, text=filename, font=self.bubble_font,
+                bg=bubble_bg, fg=BLACK, anchor="w",
+                wraplength=260).pack(anchor="w")
+        tk.Label(text_col, text=size_str, font=self.time_font,
+                bg=bubble_bg, fg=GRAY, anchor="w").pack(anchor="w", pady=(2, 0))
+
+        # 下载按钮（仅接收方显示，每个卡片独立 progress var）
         if not is_sender:
-            self._file_progress = tk.StringVar(value="下载")
-            btn = tk.Button(inner, textvariable=self._file_progress,
-                           font=self.time_font, relief=tk.GROOVE, cursor="hand2",
-                           command=lambda: self._download_file(file_id, filename))
-            btn.pack(pady=(4, 0))
-            inner._download_btn = btn
+            progress_var = tk.StringVar(value="⬇ 下载")
+            btn_frame = tk.Frame(inner, bg=bubble_bg)
+            btn_frame.pack(fill="x", pady=(8, 0))
+
+            btn = tk.Button(btn_frame, textvariable=progress_var,
+                           font=(FONT_FAMILY, 9), relief=tk.FLAT, cursor="hand2",
+                           bg="#07C160", fg=WHITE, activebackground="#06AD56",
+                           activeforeground=WHITE, padx=14, pady=2)
+            btn.config(command=lambda pv=progress_var, b=btn, fid=file_id, fn=filename:
+                       self._download_file(fid, fn, pv, b))
+            btn.pack()
 
         self._scroll_to_bottom()
 
-    def _download_file(self, file_id, filename):
-        """启动下载线程"""
+    def _download_file(self, file_id, filename, progress_var, btn):
+        """启动下载线程（独立 progress_var，不再共用 _file_progress）"""
         def download():
-            self.root.after(0, lambda: self._file_progress.set("下载中..."))
+            self.root.after(0, lambda: progress_var.set("下载中..."))
+            self.root.after(0, lambda: btn.config(state=tk.DISABLED))
             try:
                 fs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 fs.settimeout(30)
@@ -903,12 +1110,123 @@ class ChatWindow:
                         f.write(chunk)
                         received += len(chunk)
                 fs.close()
-                self.root.after(0, lambda: self._file_progress.set("已下载 ✓"))
+                self.root.after(0, lambda: progress_var.set("✓ 已下载"))
                 self._add_bubble("[系统]", f"文件已保存: {save_path}", "")
             except Exception as e:
+                self.root.after(0, lambda: progress_var.set("⬇ 重试"))
+                self.root.after(0, lambda: btn.config(state=tk.NORMAL))
                 self._add_bubble("[系统]", f"下载失败: {e}", "")
-                self.root.after(0, lambda: self._file_progress.set("重试"))
         threading.Thread(target=download, daemon=True).start()
+
+    # ========================
+    #  图片预览与查看
+    # ========================
+    def _render_image_bubble(self, sender, image_path, is_sender):
+        """在聊天气泡中渲染图片缩略图内联显示"""
+        thumb_path = self._create_thumbnail(image_path)
+        if not thumb_path:
+            # 缩略图生成失败，退回文件卡片
+            fname = os.path.basename(image_path)
+            fsize = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+            self._render_file_card(sender, fname, fsize, "", is_sender)
+            return
+
+        is_me = (sender == self.username)
+        bubble_bg = GREEN_BUBBLE if is_me else WHITE
+
+        outer = tk.Frame(self.bubble_frame, bg=BG_COLOR)
+        if is_me:
+            outer.pack(anchor="e", pady=2, padx=(40, 8))
+        else:
+            outer.pack(anchor="w", pady=2, padx=(8, 40))
+
+        if not is_me:
+            tk.Label(outer, text=sender, font=self.time_font,
+                    fg=GRAY, bg=BG_COLOR, anchor="w").pack(anchor="w", padx=(4, 0))
+
+        inner = tk.Frame(outer, bg=bubble_bg, padx=3, pady=3)
+        inner.pack()
+
+        try:
+            pil_img = Image.open(thumb_path)
+            photo = ImageTk.PhotoImage(pil_img)
+        except Exception:
+            return
+
+        # 防止垃圾回收
+        if not hasattr(self, '_photo_refs'):
+            self._photo_refs = []
+        self._photo_refs.append(photo)
+
+        lbl = tk.Label(inner, image=photo, bg=bubble_bg, cursor="hand2")
+        lbl.image = photo
+        lbl.pack()
+        lbl.bind("<Button-1>", lambda e, p=image_path: self._show_image_viewer(p))
+
+        self._scroll_to_bottom()
+
+    def _show_image_viewer(self, image_path):
+        """弹出大图查看窗口"""
+        try:
+            pil_img = Image.open(image_path)
+        except Exception:
+            return
+
+        viewer = tk.Toplevel(self.root)
+        fname = os.path.basename(image_path)
+        viewer.title(f"图片查看 - {fname}")
+        viewer.configure(bg=BLACK)
+
+        sw = viewer.winfo_screenwidth()
+        sh = viewer.winfo_screenheight()
+        max_w, max_h = int(sw * 0.8), int(sh * 0.8)
+
+        if pil_img.width > max_w or pil_img.height > max_h:
+            pil_img.thumbnail((max_w, max_h), Image.LANCZOS)
+
+        photo = ImageTk.PhotoImage(pil_img)
+        lbl = tk.Label(viewer, image=photo, bg=BLACK, cursor="hand2")
+        lbl.image = photo
+        lbl.pack()
+
+        lbl.bind("<Button-1>", lambda e: viewer.destroy())
+        viewer.bind("<Escape>", lambda e: viewer.destroy())
+
+        viewer.update_idletasks()
+        w, h = viewer.winfo_width(), viewer.winfo_height()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        viewer.geometry(f"+{x}+{y}")
+        viewer.focus_set()
+
+    def _auto_download_image(self, file_id, filename, sender):
+        """接收方自动下载图片并渲染内联预览"""
+        def run():
+            try:
+                fs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                fs.settimeout(30)
+                fs.connect((DEFAULT_HOST, FILE_PORT))
+                fs.sendall((file_id + "\n").encode(ENCODING))
+
+                os.makedirs("downloads", exist_ok=True)
+                save_path = os.path.join("downloads", filename)
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(save_path):
+                    save_path = os.path.join("downloads", f"{base} ({counter}){ext}")
+                    counter += 1
+
+                with open(save_path, "wb") as f:
+                    while True:
+                        chunk = fs.recv(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                fs.close()
+                self.root.after(0, lambda: self._render_image_bubble(sender, save_path, False))
+            except Exception as e:
+                self._add_bubble("[系统]", f"图片加载失败: {e}", "")
+        threading.Thread(target=run, daemon=True).start()
 
     # ========================
     #  发送消息
@@ -993,5 +1311,6 @@ if __name__ == "__main__":
             public_history=getattr(login, '_login_public_history', []),
             conversations=getattr(login, '_login_conversations', []),
             groups=getattr(login, '_login_groups', []),
+            contacts=getattr(login, '_login_contacts', []),
         )
         chat.run()

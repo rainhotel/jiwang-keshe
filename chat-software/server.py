@@ -19,6 +19,7 @@ from common import (
     TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
     TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
     TYPE_FILE_SEND, TYPE_FILE_NOTIFY, TYPE_FILE_DOWNLOAD,
+    TYPE_ADD_MEMBER, TYPE_SEARCH_USERS, TYPE_ADD_CONTACT,
     FILE_PORT, FILE_CHUNK,
     MAX_HISTORY, MAX_MESSAGES_PER_CHAT,
     STATUS_OK, STATUS_ERROR,
@@ -42,6 +43,7 @@ class ChatServer:
         # {username: {"addr": tuple, "socket": socket}}
         self.clients = {}            # 仅存运行时状态，不再存密码
         self.lock = threading.RLock()
+        self.send_lock = threading.Lock()
         self._init_db()
         self._load_users()
 
@@ -90,6 +92,14 @@ class ChatServer:
             )
         """)
         self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                username TEXT,
+                contact  TEXT,
+                added_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (username, contact)
+            )
+        """)
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 file_id   TEXT PRIMARY KEY,
                 filename  TEXT NOT NULL,
@@ -114,6 +124,11 @@ class ChatServer:
         for username, password in rows:
             self.clients[username] = {"password": password, "addr": None, "socket": None}
         print(f"[服务器] 已加载 {len(rows)} 个已注册用户")
+
+    def _safe_send(self, sock, data):
+        """线程安全的 socket 发送，防止多线程并发写入导致数据交错"""
+        with self.send_lock:
+            sock.sendall(data)
 
     def _get_conversations_for_user(self, username):
         """返回某用户参与过的所有私聊对象列表（按最近消息时间降序）"""
@@ -223,22 +238,23 @@ class ChatServer:
                 self.conn.commit()
                 print(f"[文件] 上传完成: {filepath} ({received_size} bytes)")
 
-                # 通知接收方
+                # 通知相关用户（公聊广播、群聊通知成员、私聊通知接收方）
                 row2 = self.conn.execute(
                     "SELECT receiver, filename, size, sender, chat_key FROM files WHERE file_id=?", (file_id,)
                 ).fetchone()
                 if row2:
                     receiver, filename, fsize, sender, chat_key = row2
-                    with self.lock:
-                        info = self.clients.get(receiver)
-                        if info and info.get("socket"):
-                            try:
-                                info["socket"].sendall(make_message(
-                                    TYPE_FILE_NOTIFY, file_id=file_id, filename=filename,
-                                    size=fsize, sender=sender,
-                                ).encode(ENCODING))
-                            except Exception:
-                                pass
+                    notify_data = make_message(
+                        TYPE_FILE_NOTIFY, file_id=file_id, filename=filename,
+                        size=fsize, sender=sender,
+                    ).encode(ENCODING)
+                    if chat_key == "public":
+                        self._notify_file_to_public(notify_data, sender)
+                    elif chat_key.startswith("group:"):
+                        gid = int(chat_key.split(":", 1)[1])
+                        self._notify_file_to_group(notify_data, gid, sender)
+                    else:
+                        self._notify_file_to_user(notify_data, receiver)
         except Exception as e:
             print(f"[文件] 连接错误: {e}")
         finally:
@@ -252,7 +268,7 @@ class ChatServer:
         filename = msg.get("filename", "").strip()
         size = msg.get("size", 0)
         if not receiver or not filename:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "参数不完整").encode(ENCODING)
             )
             return
@@ -265,7 +281,7 @@ class ChatServer:
         )
         self.conn.commit()
 
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_RESPONSE, status=STATUS_OK, file_id=file_id).encode(ENCODING)
         )
         print(f"[文件] {current_user} → {receiver}: {filename} ({size} bytes, id={file_id})")
@@ -281,13 +297,51 @@ class ChatServer:
             "SELECT file_id, filename FROM files WHERE file_id=?", (file_id,)
         ).fetchone()
         if not row:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "文件不存在").encode(ENCODING)
             )
             return
-        client_socket.sendall(
+        self._safe_send(client_socket,
             make_message(TYPE_RESPONSE, status=STATUS_OK, file_id=file_id).encode(ENCODING)
         )
+
+    def _notify_file_to_public(self, data, sender):
+        """向所有在线用户广播文件通知（公聊）"""
+        with self.lock:
+            for u, info in self.clients.items():
+                if u == sender:
+                    continue
+                if info.get("socket"):
+                    try:
+                        self._safe_send(info["socket"], data)
+                    except Exception:
+                        pass
+
+    def _notify_file_to_group(self, data, gid, sender):
+        """向群内所有成员发送文件通知"""
+        rows = self.conn.execute(
+            "SELECT username FROM group_members WHERE group_id=?", (gid,)
+        ).fetchall()
+        with self.lock:
+            for (uname,) in rows:
+                if uname == sender:
+                    continue
+                info = self.clients.get(uname)
+                if info and info.get("socket"):
+                    try:
+                        self._safe_send(info["socket"], data)
+                    except Exception:
+                        pass
+
+    def _notify_file_to_user(self, data, receiver):
+        """向指定用户发送文件通知（私聊）"""
+        with self.lock:
+            info = self.clients.get(receiver)
+            if info and info.get("socket"):
+                try:
+                    self._safe_send(info["socket"], data)
+                except Exception:
+                    pass
 
     # ========================
     #  服务器启动
@@ -297,6 +351,7 @@ class ChatServer:
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(50)
+        self.server_socket.settimeout(1.0)  # 防止 accept 永久阻塞导致 Ctrl+C 无法退出
         print(f"[服务器] 聊天服务器启动成功：{self.host}:{self.port}")
         file_thread = threading.Thread(target=self._start_file_server, daemon=True)
         file_thread.start()
@@ -305,12 +360,15 @@ class ChatServer:
 
         try:
             while True:
-                client_socket, addr = self.server_socket.accept()
-                print(f"[服务器] 新连接来自 {addr}")
-                thread = threading.Thread(
-                    target=self.handle_client, args=(client_socket, addr), daemon=True
-                )
-                thread.start()
+                try:
+                    client_socket, addr = self.server_socket.accept()
+                    print(f"[服务器] 新连接来自 {addr}")
+                    thread = threading.Thread(
+                        target=self.handle_client, args=(client_socket, addr), daemon=True
+                    )
+                    thread.start()
+                except socket.timeout:
+                    continue
         except KeyboardInterrupt:
             print("\n[服务器] 服务器正在关闭...")
         finally:
@@ -325,7 +383,7 @@ class ChatServer:
                     try:
                         sock = info.get("socket")
                         if sock:
-                            sock.sendall(make_system_msg("服务器已关闭，再见！").encode(ENCODING))
+                            self._safe_send(sock, make_system_msg("服务器已关闭，再见！").encode(ENCODING))
                     except Exception:
                         pass
         if self.server_socket:
@@ -395,6 +453,8 @@ class ChatServer:
             self._handle_create_group(msg, client_socket, current_user)
         elif msg_type == TYPE_JOIN_GROUP:
             self._handle_join_group(msg, client_socket, current_user)
+        elif msg_type == TYPE_ADD_MEMBER:
+            self._handle_add_member(msg, client_socket, current_user)
         elif msg_type == TYPE_LEAVE_GROUP:
             self._handle_leave_group(msg, client_socket, current_user)
         elif msg_type == TYPE_DELETE_GROUP:
@@ -407,8 +467,12 @@ class ChatServer:
             self._handle_file_send(msg, client_socket, current_user)
         elif msg_type == TYPE_FILE_DOWNLOAD:
             self._handle_file_download(msg, client_socket, current_user)
+        elif msg_type == TYPE_SEARCH_USERS:
+            self._handle_search_users(msg, client_socket, current_user)
+        elif msg_type == TYPE_ADD_CONTACT:
+            self._handle_add_contact(msg, client_socket, current_user)
         else:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, f"未知消息类型: {msg_type}").encode(ENCODING)
             )
         return current_user
@@ -423,7 +487,7 @@ class ChatServer:
 
         if not username or not password:
             print(f"{_ts()} _handle_register: 用户名或密码为空 → 返回错误")
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "用户名和密码不能为空").encode(ENCODING)
             )
             return None
@@ -431,7 +495,7 @@ class ChatServer:
         with self.lock:
             if username in self.clients:
                 print(f"{_ts()} _handle_register: 用户名 '{username}' 已存在 → 返回错误")
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "用户名已存在").encode(ENCODING)
                 )
                 return None
@@ -445,7 +509,7 @@ class ChatServer:
             self.clients[username] = {"password": password, "addr": None, "socket": None}
 
         print(f"{_ts()} _handle_register: 注册成功 '{username}' → 发送响应")
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_response(STATUS_OK, "注册成功").encode(ENCODING)
         )
         print(f"{_ts()} _handle_register: 响应已发送")
@@ -461,7 +525,7 @@ class ChatServer:
 
         if not username or not password:
             print(f"{_ts()} _handle_login: 用户名或密码为空 → 返回错误")
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "用户名和密码不能为空").encode(ENCODING)
             )
             return None
@@ -469,7 +533,7 @@ class ChatServer:
         with self.lock:
             if username not in self.clients:
                 print(f"{_ts()} _handle_login: 用户 '{username}' 不存在 → 返回错误")
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "用户不存在，请先注册").encode(ENCODING)
                 )
                 return None
@@ -477,13 +541,13 @@ class ChatServer:
             stored_pw = self.clients[username].get("password")
             if stored_pw is not None and stored_pw != password:
                 print(f"{_ts()} _handle_login: 密码错误 → 返回错误")
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "密码错误").encode(ENCODING)
                 )
                 return None
             if self.clients[username].get("addr") is not None:
                 print(f"{_ts()} _handle_login: 用户 '{username}' 已在线 → 返回错误")
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "该用户已在线").encode(ENCODING)
                 )
                 return None
@@ -518,11 +582,13 @@ class ChatServer:
                     "id": grp[0], "name": grp[1], "created_by": grp[2],
                     "members": [m[0] for m in mems],
                 })
+        contacts = self._get_contacts_for_user(username)
         login_resp = make_message(
             TYPE_RESPONSE, status=STATUS_OK, message="登录成功",
             public_history=public_history, conversations=conversations, groups=groups,
+            contacts=contacts,
         )
-        client_socket.sendall(login_resp.encode(ENCODING))
+        self._safe_send(client_socket, login_resp.encode(ENCODING))
 
         # 广播上线通知
         self.broadcast(f"{username} 加入了聊天室", system=True, exclude=username)
@@ -562,13 +628,13 @@ class ChatServer:
                 sock = info.get("socket")
                 if sock:
                     try:
-                        sock.sendall(data)
+                        self._safe_send(sock, data)
                     except Exception:
                         pass
 
     def _handle_broadcast(self, msg, client_socket, current_user):
         if not current_user:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "请先登录").encode(ENCODING)
             )
             return
@@ -597,7 +663,7 @@ class ChatServer:
             target_info = self.clients.get(target)
             if target_info and target_info.get("socket"):
                 try:
-                    target_info["socket"].sendall(data)
+                    self._safe_send(target_info["socket"], data)
                     return True
                 except Exception:
                     return False
@@ -605,21 +671,21 @@ class ChatServer:
 
     def _handle_private(self, msg, client_socket, current_user):
         if not current_user:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "请先登录").encode(ENCODING)
             )
             return
         target = msg.get("target", "").strip()
         content = msg.get("content", "")
         if not target or not content.strip():
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "私聊格式: @用户名 消息").encode(ENCODING)
             )
             return
 
         with self.lock:
             if target not in self.clients or self.clients[target].get("addr") is None:
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, f"用户 '{target}' 不在线").encode(ENCODING)
                 )
                 return
@@ -635,10 +701,10 @@ class ChatServer:
                 TYPE_PRIVATE, content=content, sender=current_user, target=target,
                 timestamp=saved["timestamp"],
             )
-            client_socket.sendall(echo.encode(ENCODING))
+            self._safe_send(client_socket, echo.encode(ENCODING))
             print(f"[私聊] {current_user} -> {target}: {content}")
         else:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "私聊发送失败").encode(ENCODING)
             )
 
@@ -648,7 +714,7 @@ class ChatServer:
     def _handle_get_users(self, client_socket):
         with self.lock:
             online = [u for u, info in self.clients.items() if info.get("addr") is not None]
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_GET_USERS, users=online).encode(ENCODING)
         )
 
@@ -669,7 +735,7 @@ class ChatServer:
             {"sender": r[0], "content": r[1], "timestamp": r[2]}
             for r in reversed(rows)
         ]
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_HISTORY, target=target, messages=msgs).encode(ENCODING)
         )
 
@@ -681,7 +747,7 @@ class ChatServer:
             return
         name = msg.get("name", "").strip()
         if not name:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "群名不能为空").encode(ENCODING)
             )
             return
@@ -696,7 +762,7 @@ class ChatServer:
                 (gid, current_user),
             )
             self.conn.commit()
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_RESPONSE, status=STATUS_OK, message="群创建成功",
                         group={"id": gid, "name": name, "created_by": current_user}).encode(ENCODING)
         )
@@ -711,7 +777,7 @@ class ChatServer:
         with self.lock:
             row = self.conn.execute("SELECT id, name FROM groups WHERE id=?", (gid,)).fetchone()
             if not row:
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "群不存在").encode(ENCODING)
                 )
                 return
@@ -720,7 +786,7 @@ class ChatServer:
                 (gid, current_user),
             ).fetchone()
             if exist:
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "你已在该群中").encode(ENCODING)
                 )
                 return
@@ -730,11 +796,146 @@ class ChatServer:
             )
             self.conn.commit()
         gname = row[1]
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_RESPONSE, status=STATUS_OK, message=f"已加入群 '{gname}'",
                         group={"id": gid, "name": gname}).encode(ENCODING)
         )
         print(f"[群聊] {current_user} 加入了群 '{gname}' (id={gid})")
+
+    def _handle_add_member(self, msg, client_socket, current_user):
+        """群成员邀请其他人加入群"""
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        target = msg.get("target", "").strip()
+        if not gid or not target:
+            self._safe_send(client_socket,
+                make_response(STATUS_ERROR, "参数不完整").encode(ENCODING)
+            )
+            return
+        if target == current_user:
+            self._safe_send(client_socket,
+                make_response(STATUS_ERROR, "不能添加自己").encode(ENCODING)
+            )
+            return
+        with self.lock:
+            # 检查发送者是否在群内
+            is_member = self.conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+                (gid, current_user),
+            ).fetchone()
+            if not is_member:
+                self._safe_send(client_socket,
+                    make_response(STATUS_ERROR, "你不是该群成员").encode(ENCODING)
+                )
+                return
+            # 检查目标用户是否已在群内
+            already = self.conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+                (gid, target),
+            ).fetchone()
+            if already:
+                self._safe_send(client_socket,
+                    make_response(STATUS_ERROR, f"'{target}' 已在该群中").encode(ENCODING)
+                )
+                return
+            # 检查目标用户是否存在
+            if target not in self.clients:
+                self._safe_send(client_socket,
+                    make_response(STATUS_ERROR, f"用户 '{target}' 不存在").encode(ENCODING)
+                )
+                return
+            # 添加目标用户
+            self.conn.execute(
+                "INSERT INTO group_members (group_id, username) VALUES (?, ?)",
+                (gid, target),
+            )
+            self.conn.commit()
+            # 获取群名
+            row = self.conn.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
+            gname = row[0] if row else ""
+
+        # 通知发送者
+        self._safe_send(client_socket,
+            make_message(TYPE_RESPONSE, status=STATUS_OK,
+                        message=f"已将 '{target}' 加入群 '{gname}'",
+                        group={"id": gid, "name": gname}).encode(ENCODING)
+        )
+        # 通知被添加的用户
+        target_info = self.clients.get(target)
+        if target_info and target_info.get("socket"):
+            self._safe_send(target_info["socket"],
+                make_message(TYPE_RESPONSE, status=STATUS_OK,
+                            message=f"{current_user} 将你加入了群 '{gname}'",
+                            group={"id": gid, "name": gname}).encode(ENCODING)
+            )
+        print(f"[群聊] {current_user} 将 {target} 加入了群 '{gname}' (id={gid})")
+
+    # ========================
+    #  好友/联系人
+    # ========================
+    def _get_contacts_for_user(self, username):
+        """获取某用户的好友列表"""
+        rows = self.conn.execute(
+            "SELECT contact FROM contacts WHERE username=? ORDER BY added_at", (username,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _handle_search_users(self, msg, client_socket, current_user):
+        """搜索已注册用户"""
+        if not current_user:
+            return
+        query = msg.get("query", "").strip()
+        if not query:
+            self._safe_send(client_socket,
+                make_message(TYPE_SEARCH_USERS, users=[]).encode(ENCODING)
+            )
+            return
+        rows = self.conn.execute(
+            "SELECT username FROM users WHERE username LIKE ? AND username != ? LIMIT 20",
+            (f"%{query}%", current_user),
+        ).fetchall()
+        users = [r[0] for r in rows]
+        self._safe_send(client_socket,
+            make_message(TYPE_SEARCH_USERS, users=users).encode(ENCODING)
+        )
+
+    def _handle_add_contact(self, msg, client_socket, current_user):
+        """添加好友"""
+        if not current_user:
+            return
+        target = msg.get("username", "").strip()
+        if not target or target == current_user:
+            self._safe_send(client_socket,
+                make_response(STATUS_ERROR, "参数无效").encode(ENCODING)
+            )
+            return
+        with self.lock:
+            if target not in self.clients:
+                self._safe_send(client_socket,
+                    make_response(STATUS_ERROR, "用户不存在").encode(ENCODING)
+                )
+                return
+            exist = self.conn.execute(
+                "SELECT 1 FROM contacts WHERE username=? AND contact=?",
+                (current_user, target),
+            ).fetchone()
+            if exist:
+                self._safe_send(client_socket,
+                    make_response(STATUS_ERROR, "已在好友列表中").encode(ENCODING)
+                )
+                return
+            self.conn.execute(
+                "INSERT INTO contacts (username, contact) VALUES (?, ?)",
+                (current_user, target),
+            )
+            self.conn.commit()
+        self._safe_send(client_socket,
+            make_message(TYPE_RESPONSE, status=STATUS_OK,
+                        message=f"已添加 '{target}' 为好友",
+                        contact=target).encode(ENCODING)
+        )
+        print(f"[好友] {current_user} 添加了 {target} 为好友")
 
     def _handle_leave_group(self, msg, client_socket, current_user):
         if not current_user:
@@ -748,7 +949,7 @@ class ChatServer:
                 (gid, current_user),
             )
             self.conn.commit()
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_response(STATUS_OK, "已退出群").encode(ENCODING)
         )
         print(f"[群聊] {current_user} 退出了群 (id={gid})")
@@ -764,19 +965,19 @@ class ChatServer:
                 "SELECT created_by FROM groups WHERE id=?", (gid,)
             ).fetchone()
             if not row:
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "群不存在").encode(ENCODING)
                 )
                 return
             if row[0] != current_user:
-                client_socket.sendall(
+                self._safe_send(client_socket, 
                     make_response(STATUS_ERROR, "只有群创建者可以解散群").encode(ENCODING)
                 )
                 return
             self.conn.execute("DELETE FROM group_members WHERE group_id=?", (gid,))
             self.conn.execute("DELETE FROM groups WHERE id=?", (gid,))
             self.conn.commit()
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_response(STATUS_OK, "群已解散").encode(ENCODING)
         )
         print(f"[群聊] {current_user} 解散了群 (id={gid})")
@@ -791,7 +992,7 @@ class ChatServer:
             "SELECT username FROM group_members WHERE group_id=?", (gid,)
         ).fetchall()
         members = [r[0] for r in rows]
-        client_socket.sendall(
+        self._safe_send(client_socket, 
             make_message(TYPE_GROUP_USERS, group_id=gid, users=members).encode(ENCODING)
         )
 
@@ -808,7 +1009,7 @@ class ChatServer:
             (gid, current_user),
         ).fetchone()
         if not member:
-            client_socket.sendall(
+            self._safe_send(client_socket, 
                 make_response(STATUS_ERROR, "你不是该群成员").encode(ENCODING)
             )
             return
@@ -828,7 +1029,7 @@ class ChatServer:
                 info = self.clients.get(uname)
                 if info and info.get("socket"):
                     try:
-                        info["socket"].sendall(data)
+                        self._safe_send(info["socket"], data)
                     except Exception:
                         pass
         print(f"[群聊-{gid}] {current_user}: {content}")
