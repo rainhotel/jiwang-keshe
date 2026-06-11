@@ -315,6 +315,21 @@ class ChatWindow:
                                    font=(FONT_FAMILY, 9), relief=tk.FLAT, cursor="hand2")
         self.send_btn.pack(side=tk.RIGHT, padx=(6, 0), ipady=2)
 
+    def _wrap_text(self, text, max_width):
+        """将文本按像素宽度换行"""
+        lines = []
+        current = ""
+        for char in text:
+            if self.bubble_font.measure(current + char) <= max_width:
+                current += char
+            else:
+                if current:
+                    lines.append(current)
+                current = char
+        if current:
+            lines.append(current)
+        return lines if lines else [""]
+
     def _on_canvas_resize(self, event):
         self.chat_canvas.itemconfig(self.canvas_window, width=event.width)
 
@@ -324,6 +339,68 @@ class ChatWindow:
 
     def _unbind_mousewheel(self):
         self.chat_canvas.unbind_all("<MouseWheel>")
+
+    def _render_bubble(self, sender, content, timestamp_str):
+        """在 bubble_frame 中渲染一条聊天气泡"""
+        is_me = (sender == self.username)
+        is_system = (sender == "[系统]")
+
+        if is_system:
+            lbl = tk.Label(self.bubble_frame, text=content, font=self.time_font,
+                          fg=BLUE_SYSTEM, bg=BG_COLOR)
+            lbl.pack(pady=2)
+            return
+
+        max_text_width = 380
+        lines = self._wrap_text(content, max_text_width)
+        bubble_bg = GREEN_BUBBLE if is_me else WHITE
+
+        # 气泡容器
+        bubble_outer = tk.Frame(self.bubble_frame, bg=BG_COLOR)
+        if is_me:
+            bubble_outer.pack(anchor="e", pady=1, padx=(40, 6))
+        else:
+            bubble_outer.pack(anchor="w", pady=1, padx=(6, 40))
+
+        # 发送者名（对方的消息显示名字）
+        if not is_me:
+            name_lbl = tk.Label(bubble_outer, text=sender, font=self.time_font,
+                               fg=GRAY, bg=BG_COLOR, anchor="w")
+            name_lbl.pack(anchor="w", padx=(4, 0))
+
+        # 气泡体
+        inner = tk.Frame(bubble_outer, bg=bubble_bg)
+        inner.pack(anchor="e" if is_me else "w")
+
+        for line in lines:
+            lbl = tk.Label(inner, text=line, font=self.bubble_font,
+                          bg=bubble_bg, fg=BLACK, justify=tk.LEFT)
+            lbl.pack(anchor="w", padx=10, pady=(1, 0))
+
+        # 时间戳
+        ts = self._format_time(timestamp_str)
+        ts_lbl = tk.Label(bubble_outer, text=ts, font=self.time_font,
+                         fg=GRAY, bg=BG_COLOR)
+        if is_me:
+            ts_lbl.pack(anchor="e", padx=(0, 4))
+        else:
+            ts_lbl.pack(anchor="w", padx=(4, 0))
+
+    def _add_bubble(self, sender, content, timestamp_str):
+        """添加单条气泡（实时消息，线程安全）"""
+        def _add():
+            self._render_bubble(sender, content, timestamp_str)
+            self._scroll_to_bottom()
+        self.root.after(0, _add)
+
+    def _format_time(self, ts_str):
+        """将 ISO 时间戳转为 HH:MM"""
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            local = dt.astimezone()
+            return local.strftime("%H:%M")
+        except Exception:
+            return ""
 
     def _scroll_to_bottom(self):
         self.chat_canvas.after(50, lambda: self.chat_canvas.yview_moveto(1.0))
@@ -337,7 +414,20 @@ class ChatWindow:
         self.root.after(0, _rebuild)
 
     def _render_history(self, messages):
-        pass  # Will be implemented in Task 5
+        """渲染一组历史消息到气泡区"""
+        self._clear_bubbles()
+        for m in messages:
+            self._render_bubble(
+                m.get("sender", "未知"),
+                m.get("content", ""),
+                m.get("timestamp", ""),
+            )
+        self._scroll_to_bottom()
+
+    def _clear_bubbles(self):
+        """清空气泡区"""
+        for w in self.bubble_frame.winfo_children():
+            w.destroy()
 
     def _on_conversation_select(self, event=None):
         pass  # Will be implemented in Task 6
