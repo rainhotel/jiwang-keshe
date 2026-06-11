@@ -201,10 +201,10 @@ class ChatWindow:
         self.current_chat = "public"
         self.online_users = set()
         self._conv_partners = list(conversations) if conversations else []
-        self.bubble_font = tkfont.Font(family=FONT_FAMILY, size=10)
-        self.time_font = tkfont.Font(family=FONT_FAMILY, size=8)
 
         self.root = tk.Tk()
+        self.bubble_font = tkfont.Font(family=FONT_FAMILY, size=10)
+        self.time_font = tkfont.Font(family=FONT_FAMILY, size=8)
         self.root.title(f"局域网聊天 - {username}")
         self.root.geometry("800x550")
         self.root.configure(bg=BG_COLOR)
