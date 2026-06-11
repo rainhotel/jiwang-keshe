@@ -7,6 +7,7 @@ import socket
 import threading
 import json
 import os
+import sqlite3
 import time
 
 from common import (
@@ -20,8 +21,7 @@ from common import (
     now_iso, conversation_key,
 )
 
-USERS_FILE = "users.json"
-MESSAGES_FILE = "messages.json"
+DB_FILE = "chat.db"
 
 
 def _ts():
@@ -34,85 +34,53 @@ class ChatServer:
         self.host = host
         self.port = port
         self.server_socket = None
-        # {username: {"password": str, "addr": tuple}}
-        self.clients = {}
-        self.lock = threading.RLock()  # 可重入锁，避免 _save_users 内部死锁
+        # {username: {"addr": tuple, "socket": socket}}
+        self.clients = {}            # 仅存运行时状态，不再存密码
+        self.lock = threading.RLock()
+        self._init_db()
         self._load_users()
-        self.messages = {"public": []}
-        self._load_messages()
+
+    def _init_db(self):
+        """打开 SQLite 连接，启用 WAL，建表"""
+        self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username   TEXT PRIMARY KEY,
+                password   TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_key  TEXT NOT NULL,
+                sender    TEXT NOT NULL,
+                content   TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_chat
+            ON messages(chat_key, id)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+            ON messages(chat_key, timestamp)
+        """)
+        self.conn.commit()
 
     # ========================
     #  用户数据持久化
     # ========================
     def _load_users(self):
-        """从JSON文件加载已注册用户"""
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, "r", encoding=ENCODING) as f:
-                users = json.load(f)
-            for u, p in users.items():
-                self.clients[u] = {"password": p, "addr": None}
-            print(f"[服务器] 已加载 {len(users)} 个已注册用户")
-        else:
-            print("[服务器] 用户数据文件不存在，将创建新文件")
-
-    def _save_users(self):
-        """持久化已注册用户（仅保存密码）。调用方可以持有锁，本方法会自行加锁。"""
-        with self.lock:
-            data = {u: info["password"] for u, info in self.clients.items()}
-        with open(USERS_FILE, "w", encoding=ENCODING) as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    # ========================
-    #  消息持久化
-    # ========================
-    def _load_messages(self):
-        """从 JSON 文件加载历史消息"""
-        if os.path.exists(MESSAGES_FILE):
-            with open(MESSAGES_FILE, "r", encoding=ENCODING) as f:
-                self.messages = json.load(f)
-            total = sum(len(v) for v in self.messages.values())
-            print(f"[服务器] 已加载 {total} 条历史消息 ({len(self.messages)} 个会话)")
-        else:
-            self.messages = {"public": []}
-            print("[服务器] 消息文件不存在，将创建新文件")
-
-    def _save_messages(self):
-        """持久化消息到磁盘"""
-        with self.lock:
-            data = self.messages
-        with open(MESSAGES_FILE, "w", encoding=ENCODING) as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    def _add_message(self, key, sender, content):
-        """添加一条消息到 messages 并持久化，返回带 timestamp 的 msg dict"""
-        msg = {
-            "sender": sender,
-            "content": content,
-            "timestamp": now_iso(),
-        }
-        with self.lock:
-            if key not in self.messages:
-                self.messages[key] = []
-            self.messages[key].append(msg)
-            if len(self.messages[key]) > MAX_MESSAGES_PER_CHAT:
-                self.messages[key] = self.messages[key][-MAX_MESSAGES_PER_CHAT:]
-        self._save_messages()
-        return msg
-
-    def _get_conversations_for_user(self, username):
-        """返回某用户参与过的所有私聊对象列表（按最近消息时间降序）"""
-        partners = []
-        with self.lock:
-            for key in self.messages:
-                if key == "public":
-                    continue
-                users = key.split(":")
-                if username in users:
-                    partner = users[0] if users[1] == username else users[1]
-                    last_ts = self.messages[key][-1]["timestamp"] if self.messages[key] else ""
-                    partners.append((partner, last_ts))
-        partners.sort(key=lambda x: x[1], reverse=True)
-        return [p[0] for p in partners]
+        """从 SQLite 加载已注册用户到运行时字典"""
+        rows = self.conn.execute(
+            "SELECT username, password FROM users"
+        ).fetchall()
+        for username, password in rows:
+            self.clients[username] = {"password": password, "addr": None, "socket": None}
+        print(f"[服务器] 已加载 {len(rows)} 个已注册用户")
 
     # ========================
     #  服务器启动
