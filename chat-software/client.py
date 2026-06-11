@@ -758,6 +758,15 @@ class ChatWindow:
             if self.current_chat == f"group:{gid}":
                 self._add_bubble(sender, content, ts)
 
+        elif msg_type == TYPE_FILE_NOTIFY:
+            filename = msg.get("filename", "")
+            fsize = msg.get("size", 0)
+            file_id = msg.get("file_id", "")
+            sender = msg.get("sender", "")
+            self.root.after(0, lambda: self._render_file_card(
+                sender, filename, fsize, file_id, False,
+            ))
+
     def _show_emoji_panel(self):
         """弹出 emoji 选择面板"""
         panel = tk.Toplevel(self.root)
@@ -866,6 +875,40 @@ class ChatWindow:
             inner._download_btn = btn
 
         self._scroll_to_bottom()
+
+    def _download_file(self, file_id, filename):
+        """启动下载线程"""
+        def download():
+            self.root.after(0, lambda: self._file_progress.set("下载中..."))
+            try:
+                fs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                fs.settimeout(30)
+                fs.connect((DEFAULT_HOST, FILE_PORT))
+                fs.sendall((file_id + "\n").encode(ENCODING))
+
+                os.makedirs("downloads", exist_ok=True)
+                save_path = os.path.join("downloads", filename)
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(save_path):
+                    save_path = os.path.join("downloads", f"{base} ({counter}){ext}")
+                    counter += 1
+
+                received = 0
+                with open(save_path, "wb") as f:
+                    while True:
+                        chunk = fs.recv(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                fs.close()
+                self.root.after(0, lambda: self._file_progress.set("已下载 ✓"))
+                self._add_bubble("[系统]", f"文件已保存: {save_path}", "")
+            except Exception as e:
+                self._add_bubble("[系统]", f"下载失败: {e}", "")
+                self.root.after(0, lambda: self._file_progress.set("重试"))
+        threading.Thread(target=download, daemon=True).start()
 
     # ========================
     #  发送消息
