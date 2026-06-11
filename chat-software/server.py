@@ -236,8 +236,20 @@ class ChatServer:
             self._handle_private(msg, client_socket, current_user)
         elif msg_type == TYPE_GET_USERS:
             self._handle_get_users(client_socket)
-        elif msg_type == TYPE_GET_HISTORY:                    # 新增
+        elif msg_type == TYPE_GET_HISTORY:
             self._handle_get_history(msg, client_socket, current_user)
+        elif msg_type == TYPE_CREATE_GROUP:
+            self._handle_create_group(msg, client_socket, current_user)
+        elif msg_type == TYPE_JOIN_GROUP:
+            self._handle_join_group(msg, client_socket, current_user)
+        elif msg_type == TYPE_LEAVE_GROUP:
+            self._handle_leave_group(msg, client_socket, current_user)
+        elif msg_type == TYPE_DELETE_GROUP:
+            self._handle_delete_group(msg, client_socket, current_user)
+        elif msg_type == TYPE_GROUP_USERS:
+            self._handle_group_users(msg, client_socket, current_user)
+        elif msg_type == TYPE_GROUP_MSG:
+            self._handle_group_msg(msg, client_socket, current_user)
         else:
             client_socket.sendall(
                 make_response(STATUS_ERROR, f"未知消息类型: {msg_type}").encode(ENCODING)
@@ -488,6 +500,166 @@ class ChatServer:
         client_socket.sendall(
             make_message(TYPE_HISTORY, target=target, messages=msgs).encode(ENCODING)
         )
+
+    # ========================
+    #  群聊管理
+    # ========================
+    def _handle_create_group(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        name = msg.get("name", "").strip()
+        if not name:
+            client_socket.sendall(
+                make_response(STATUS_ERROR, "群名不能为空").encode(ENCODING)
+            )
+            return
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT INTO groups (name, created_by) VALUES (?, ?)",
+                (name, current_user),
+            )
+            gid = cur.lastrowid
+            self.conn.execute(
+                "INSERT INTO group_members (group_id, username) VALUES (?, ?)",
+                (gid, current_user),
+            )
+            self.conn.commit()
+        client_socket.sendall(
+            make_message(TYPE_RESPONSE, status=STATUS_OK, message="群创建成功",
+                        group={"id": gid, "name": name, "created_by": current_user}).encode(ENCODING)
+        )
+        print(f"[群聊] {current_user} 创建了群 '{name}' (id={gid})")
+
+    def _handle_join_group(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        if not gid:
+            return
+        with self.lock:
+            row = self.conn.execute("SELECT id, name FROM groups WHERE id=?", (gid,)).fetchone()
+            if not row:
+                client_socket.sendall(
+                    make_response(STATUS_ERROR, "群不存在").encode(ENCODING)
+                )
+                return
+            exist = self.conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+                (gid, current_user),
+            ).fetchone()
+            if exist:
+                client_socket.sendall(
+                    make_response(STATUS_ERROR, "你已在该群中").encode(ENCODING)
+                )
+                return
+            self.conn.execute(
+                "INSERT INTO group_members (group_id, username) VALUES (?, ?)",
+                (gid, current_user),
+            )
+            self.conn.commit()
+        gname = row[1]
+        client_socket.sendall(
+            make_message(TYPE_RESPONSE, status=STATUS_OK, message=f"已加入群 '{gname}'",
+                        group={"id": gid, "name": gname}).encode(ENCODING)
+        )
+        print(f"[群聊] {current_user} 加入了群 '{gname}' (id={gid})")
+
+    def _handle_leave_group(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        if not gid:
+            return
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM group_members WHERE group_id=? AND username=?",
+                (gid, current_user),
+            )
+            self.conn.commit()
+        client_socket.sendall(
+            make_response(STATUS_OK, "已退出群").encode(ENCODING)
+        )
+        print(f"[群聊] {current_user} 退出了群 (id={gid})")
+
+    def _handle_delete_group(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        if not gid:
+            return
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT created_by FROM groups WHERE id=?", (gid,)
+            ).fetchone()
+            if not row:
+                client_socket.sendall(
+                    make_response(STATUS_ERROR, "群不存在").encode(ENCODING)
+                )
+                return
+            if row[0] != current_user:
+                client_socket.sendall(
+                    make_response(STATUS_ERROR, "只有群创建者可以解散群").encode(ENCODING)
+                )
+                return
+            self.conn.execute("DELETE FROM group_members WHERE group_id=?", (gid,))
+            self.conn.execute("DELETE FROM groups WHERE id=?", (gid,))
+            self.conn.commit()
+        client_socket.sendall(
+            make_response(STATUS_OK, "群已解散").encode(ENCODING)
+        )
+        print(f"[群聊] {current_user} 解散了群 (id={gid})")
+
+    def _handle_group_users(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        if not gid:
+            return
+        rows = self.conn.execute(
+            "SELECT username FROM group_members WHERE group_id=?", (gid,)
+        ).fetchall()
+        members = [r[0] for r in rows]
+        client_socket.sendall(
+            make_message(TYPE_GROUP_USERS, group_id=gid, users=members).encode(ENCODING)
+        )
+
+    def _handle_group_msg(self, msg, client_socket, current_user):
+        if not current_user:
+            return
+        gid = msg.get("group_id")
+        content = msg.get("content", "")
+        if not gid or not content.strip():
+            return
+        # 检查是否群成员
+        member = self.conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+            (gid, current_user),
+        ).fetchone()
+        if not member:
+            client_socket.sendall(
+                make_response(STATUS_ERROR, "你不是该群成员").encode(ENCODING)
+            )
+            return
+
+        key = group_key(gid)
+        saved = self._add_message_db(key, current_user, content)
+        full_msg = make_message(
+            TYPE_GROUP_MSG, group_id=gid, content=content, sender=current_user,
+            timestamp=saved["timestamp"],
+        )
+        rows = self.conn.execute(
+            "SELECT username FROM group_members WHERE group_id=?", (gid,)
+        ).fetchall()
+        data = full_msg.encode(ENCODING)
+        with self.lock:
+            for (uname,) in rows:
+                info = self.clients.get(uname)
+                if info and info.get("socket"):
+                    try:
+                        info["socket"].sendall(data)
+                    except Exception:
+                        pass
+        print(f"[群聊-{gid}] {current_user}: {content}")
 
 
 if __name__ == "__main__":
