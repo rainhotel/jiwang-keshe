@@ -817,6 +817,17 @@ class ChatWindow:
                 self._add_bubble("[系统]", "私聊格式: @用户名 消息内容", "")
                 return
 
+        # 群聊
+        if self.current_chat.startswith("group:"):
+            gid = int(self.current_chat.split(":")[1])
+            ts = datetime.now(timezone.utc).isoformat()
+            msg = make_message(TYPE_GROUP_MSG, group_id=gid, content=content, timestamp=ts)
+            try:
+                self.socket.sendall(msg.encode(ENCODING))
+            except Exception as e:
+                self._add_bubble("[系统]", f"发送失败: {e}", "")
+            return
+
         # 公聊
         ts = datetime.now(timezone.utc).isoformat()
         msg = make_message(TYPE_BROADCAST, content=content, timestamp=ts)
