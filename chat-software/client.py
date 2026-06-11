@@ -10,15 +10,17 @@ import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
     TYPE_REGISTER, TYPE_LOGIN, TYPE_BROADCAST, TYPE_PRIVATE,
     TYPE_GET_USERS, TYPE_SYSTEM, TYPE_RESPONSE,
     TYPE_GET_HISTORY, TYPE_HISTORY,
+    TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
+    TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
     STATUS_OK, STATUS_ERROR,
-    make_message, parse_message, conversation_key,
+    make_message, parse_message, conversation_key, group_key,
 )
 
 # 微信风格配色
@@ -276,6 +278,8 @@ class ChatWindow:
                                        selectmode="browse", height=20)
         self.conv_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self.conv_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.conv_tree.bind("<Button-3>", self._on_tree_right_click)
+        self._tree_menu = tk.Menu(self.left_frame, tearoff=0)
 
         # 根节点
         self.tree_root = self.conv_tree.insert("", "end", text="", open=True, iid="root")
@@ -523,6 +527,79 @@ class ChatWindow:
             except Exception:
                 pass
 
+    def _on_tree_right_click(self, event):
+        item = self.conv_tree.identify_row(event.y)
+        if not item or item in ("root", "public", "groups", "contacts"):
+            return
+        self.conv_tree.selection_set(item)
+
+        self._tree_menu.delete(0, tk.END)
+        if item.startswith("group:"):
+            gid = int(item.split(":")[1])
+            grp = None
+            for g in self._groups:
+                if g['id'] == gid:
+                    grp = g
+                    break
+            if not grp:
+                return
+            self._tree_menu.add_command(label="查看成员", command=lambda g=gid: self._show_group_members(g))
+            self._tree_menu.add_command(label="退出群", command=lambda g=gid: self._leave_group(g))
+            if grp.get("created_by") == self.username:
+                self._tree_menu.add_command(label="解散群", command=lambda g=gid: self._delete_group(g))
+        elif item.startswith("contact:"):
+            self._tree_menu.add_command(label="发起私聊", command=lambda: self._on_tree_select())
+        self._tree_menu.post(event.x_root, event.y_root)
+
+    def _create_group_dialog(self):
+        name = simpledialog.askstring("创建群聊", "请输入群名:", parent=self.root)
+        if not name or not name.strip():
+            return
+        try:
+            self.socket.sendall(
+                make_message(TYPE_CREATE_GROUP, name=name.strip()).encode(ENCODING)
+            )
+        except Exception as e:
+            self._add_bubble("[系统]", f"创建群失败: {e}", "")
+
+    def _show_group_members(self, gid):
+        try:
+            self.socket.sendall(
+                make_message(TYPE_GROUP_USERS, group_id=gid).encode(ENCODING)
+            )
+        except Exception:
+            pass
+
+    def _leave_group(self, gid):
+        try:
+            self.socket.sendall(
+                make_message(TYPE_LEAVE_GROUP, group_id=gid).encode(ENCODING)
+            )
+        except Exception:
+            pass
+        self._groups = [g for g in self._groups if g['id'] != gid]
+        self._rebuild_conv_list()
+
+    def _delete_group(self, gid):
+        try:
+            self.socket.sendall(
+                make_message(TYPE_DELETE_GROUP, group_id=gid).encode(ENCODING)
+            )
+        except Exception:
+            pass
+        self._groups = [g for g in self._groups if g['id'] != gid]
+        self._rebuild_conv_list()
+
+    def _switch_to(self, chat_key):
+        """切换当前会话并加载历史"""
+        self.current_chat = chat_key
+        try:
+            self.socket.sendall(
+                make_message(TYPE_GET_HISTORY, target=chat_key).encode(ENCODING)
+            )
+        except Exception:
+            pass
+
     def _filter_conversations(self):
         query = self.search_var.get().strip()
         if query == "搜索" or not query:
@@ -644,7 +721,29 @@ class ChatWindow:
             self._update_users(msg.get("users", []))
 
         elif msg_type == TYPE_RESPONSE:
-            pass  # 登录/注册响应已在 LoginWindow 处理，忽略
+            # 群创建/加入响应
+            group_data = msg.get("group")
+            if group_data:
+                exist = [g for g in self._groups if g['id'] == group_data['id']]
+                if not exist:
+                    self._groups.append(group_data)
+                self._rebuild_conv_list()
+                self.root.after(100, lambda gid=group_data['id']: self._switch_to(f"group:{gid}"))
+
+        elif msg_type == TYPE_GROUP_USERS:
+            users = msg.get("users", [])
+            gid = msg.get("group_id")
+            self.root.after(0, lambda: messagebox.showinfo(
+                f"群成员 (id={gid})", "\n".join(users),
+            ))
+
+        elif msg_type == TYPE_GROUP_MSG:
+            sender = msg.get("sender", "未知")
+            content = msg.get("content", "")
+            ts = msg.get("timestamp", "")
+            gid = msg.get("group_id")
+            if self.current_chat == f"group:{gid}":
+                self._add_bubble(sender, content, ts)
 
     def _show_emoji_panel(self):
         """弹出 emoji 选择面板"""
