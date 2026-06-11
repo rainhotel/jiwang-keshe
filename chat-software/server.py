@@ -153,6 +153,7 @@ class ChatServer:
         if self.server_socket:
             self.server_socket.close()
         self._save_users()
+        self._save_messages()                              # 新增
         print("[服务器] 服务器已关闭")
 
     # ========================
@@ -211,6 +212,8 @@ class ChatServer:
             self._handle_private(msg, client_socket, current_user)
         elif msg_type == TYPE_GET_USERS:
             self._handle_get_users(client_socket)
+        elif msg_type == TYPE_GET_HISTORY:                    # 新增
+            self._handle_get_history(msg, client_socket, current_user)
         else:
             client_socket.sendall(
                 make_response(STATUS_ERROR, f"未知消息类型: {msg_type}").encode(ENCODING)
@@ -289,9 +292,13 @@ class ChatServer:
             self.clients[username]["socket"] = client_socket
 
         print(f"{_ts()} _handle_login: 登录成功 '{username}' → 发送响应")
-        client_socket.sendall(
-            make_response(STATUS_OK, "登录成功").encode(ENCODING)
+        public_history = self.messages.get("public", [])[-MAX_HISTORY:]
+        conversations = self._get_conversations_for_user(username)
+        login_resp = make_message(
+            TYPE_RESPONSE, status=STATUS_OK, message="登录成功",
+            public_history=public_history, conversations=conversations,
         )
+        client_socket.sendall(login_resp.encode(ENCODING))
         print(f"{_ts()} _handle_login: 响应已发送, 广播上线通知")
 
         # 广播上线通知
@@ -345,8 +352,11 @@ class ChatServer:
         content = msg.get("content", "")
         if not content.strip():
             return
+        # 保存到 messages
+        saved = self._add_message("public", current_user, content)
         full_msg = make_message(
-            TYPE_BROADCAST, content=content, sender=current_user
+            TYPE_BROADCAST, content=content, sender=current_user,
+            timestamp=saved["timestamp"],
         )
         print(f"[公聊] {current_user}: {content}")
         self.broadcast(full_msg, exclude=current_user)
@@ -391,11 +401,16 @@ class ChatServer:
                 )
                 return
 
+        # 保存消息
+        key = conversation_key(current_user, target)
+        saved = self._add_message(key, current_user, content)
+
         ok = self.private_message(target, content, current_user)
         if ok:
             # 回显给发送方
             echo = make_message(
-                TYPE_PRIVATE, content=content, sender=current_user, target=target
+                TYPE_PRIVATE, content=content, sender=current_user, target=target,
+                timestamp=saved["timestamp"],
             )
             client_socket.sendall(echo.encode(ENCODING))
             print(f"[私聊] {current_user} -> {target}: {content}")
@@ -412,6 +427,20 @@ class ChatServer:
             online = [u for u, info in self.clients.items() if info.get("addr") is not None]
         client_socket.sendall(
             make_message(TYPE_GET_USERS, users=online).encode(ENCODING)
+        )
+
+    def _handle_get_history(self, msg, client_socket, current_user):
+        """返回指定会话的最近 MAX_HISTORY 条历史"""
+        if not current_user:
+            return
+        target = msg.get("target", "public")
+        # 如果是私聊会话，用 conversation_key 构造真正的 key
+        if target != "public":
+            target = conversation_key(current_user, target)
+        with self.lock:
+            msgs = self.messages.get(target, [])[-MAX_HISTORY:]
+        client_socket.sendall(
+            make_message(TYPE_HISTORY, target=target, messages=msgs).encode(ENCODING)
         )
 
 
