@@ -9,7 +9,7 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
-from tkinter import scrolledtext, messagebox, simpledialog
+from tkinter import messagebox
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
@@ -430,10 +430,42 @@ class ChatWindow:
             w.destroy()
 
     def _on_conversation_select(self, event=None):
-        pass  # Will be implemented in Task 6
+        selection = self.conv_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx == 0:
+            self.current_chat = "public"
+            self.title_label.config(text="公聊大厅")
+        else:
+            partner_idx = idx - 1
+            if partner_idx < len(self._conv_partners):
+                partner = self._conv_partners[partner_idx]
+                self.current_chat = partner
+                self.title_label.config(text=partner)
+            else:
+                return
+        # 请求历史
+        target = "public" if self.current_chat == "public" else self.current_chat
+        try:
+            self.socket.sendall(
+                make_message(TYPE_GET_HISTORY, target=target).encode(ENCODING)
+            )
+        except Exception:
+            pass
 
     def _filter_conversations(self):
-        pass  # Will be implemented in Task 6
+        query = self.search_var.get().strip()
+        if query == "搜索" or not query:
+            self._rebuild_conv_list()
+            return
+        def _filter():
+            self.conv_listbox.delete(0, tk.END)
+            self.conv_listbox.insert(tk.END, "★ 公聊大厅")
+            for p in self._conv_partners:
+                if query.lower() in p.lower():
+                    self.conv_listbox.insert(tk.END, f"  {p}")
+        self.root.after(0, _filter)
 
     def _on_search_focus_in(self):
         if self.search_var.get() == "搜索":
@@ -446,46 +478,36 @@ class ChatWindow:
             self.search_entry.config(fg=GRAY)
 
     def refresh_users(self):
-        pass  # Will be implemented in Task 6
+        """请求在线用户列表"""
+        try:
+            self.socket.sendall(
+                make_message(TYPE_GET_USERS).encode(ENCODING)
+            )
+        except Exception:
+            pass
 
     # ========================
     #  界面更新（线程安全）
     # ========================
-    def append_text(self, text, tag=None):
-        """在主线程中追加聊天文本"""
-        def _append():
-            self.chat_display.config(state="normal")
-            self.chat_display.insert("end", text, tag)
-            self.chat_display.see("end")
-            self.chat_display.config(state="disabled")
-        self.root.after(0, _append)
-
-
-    def update_user_list(self, users):
-        """更新右侧在线用户列表"""
-        def _update():
-            self.user_listbox.delete(0, "end")
-            for u in users:
-                display = f"● {u}"
-                self.user_listbox.insert("end", display)
-        self.root.after(0, _update)
+    def _update_users(self, users):
+        def _upd():
+            self.online_users = set(users)
+        self.root.after(0, _upd)
 
     # ========================
     #  消息接收循环
     # ========================
     def receive_loop(self):
-        """后台线程：持续接收服务器消息，处理 TCP 粘包"""
+        """后台线程：持续接收服务器消息"""
         buffer = ""
         decoder = json.JSONDecoder()
         while self.running:
             try:
                 data = self.socket.recv(BUFFER_SIZE)
                 if not data:
-                    self.append_text("[系统] 与服务器断开连接\n", "red")
+                    self._add_bubble("[系统]", "与服务器断开连接", "")
                     break
                 buffer += data.decode(ENCODING)
-
-                # 循环解析 buffer 中的所有完整 JSON 对象
                 while buffer:
                     stripped = buffer.lstrip()
                     if not stripped:
@@ -496,14 +518,14 @@ class ChatWindow:
                         buffer = stripped[end:]
                         self._handle_message(obj)
                     except json.JSONDecodeError:
-                        break  # 数据不完整，等下次 recv
+                        break
             except (ConnectionResetError, ConnectionAbortedError, OSError):
                 if self.running:
-                    self.append_text("[系统] 与服务器断开连接\n", "red")
+                    self._add_bubble("[系统]", "与服务器断开连接", "")
                 break
             except Exception as e:
                 if self.running:
-                    self.append_text(f"[系统] 接收异常: {e}\n", "red")
+                    self._add_bubble("[系统]", f"接收异常: {e}", "")
                 break
 
     def _handle_message(self, msg):
@@ -511,16 +533,35 @@ class ChatWindow:
         if msg_type == TYPE_BROADCAST:
             sender = msg.get("sender", "未知")
             content = msg.get("content", "")
+            ts = msg.get("timestamp", "")
             if sender == "[系统]":
-                self.append_text(f"{content}\n", "blue")
-            else:
-                self.append_text(f"[{sender}] {content}\n")
+                # 系统消息始终显示
+                self._add_bubble(sender, content, ts)
+            elif self.current_chat == "public":
+                self._add_bubble(sender, content, ts)
+
         elif msg_type == TYPE_PRIVATE:
             sender = msg.get("sender", "未知")
             content = msg.get("content", "")
-            self.append_text(f"[私聊] {sender} -> 你: {content}\n", "green")
+            ts = msg.get("timestamp", "")
+            target = msg.get("target", "")
+            partner = target if sender == self.username else sender
+            # 显示在当前会话中
+            if self.current_chat == partner or self.current_chat == sender:
+                self._add_bubble(sender, content, ts)
+            # 将联系人加入左侧列表
+            if partner != self.username and partner not in self._conv_partners:
+                self._conv_partners.append(partner)
+                self._rebuild_conv_list()
+
+        elif msg_type == TYPE_HISTORY:
+            self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
+
         elif msg_type == TYPE_GET_USERS:
-            self.update_user_list(msg.get("users", []))
+            self._update_users(msg.get("users", []))
+
+        elif msg_type == TYPE_RESPONSE:
+            pass  # 登录/注册响应已在 LoginWindow 处理，忽略
 
     # ========================
     #  发送消息
@@ -531,46 +572,42 @@ class ChatWindow:
             return
         self.entry_msg.delete(0, "end")
 
-        # 判断是否为私聊格式: @用户名 消息
+        # 私聊: @用户名 消息
         if content.startswith("@"):
             parts = content.split(" ", 1)
             if len(parts) >= 2:
-                target = parts[0][1:]  # 去掉@
+                target = parts[0][1:]
                 msg_content = parts[1]
-                msg = make_message(TYPE_PRIVATE, target=target, content=msg_content)
+                ts = datetime.now(timezone.utc).isoformat()
+                msg = make_message(TYPE_PRIVATE, target=target, content=msg_content,
+                                   timestamp=ts)
                 try:
                     self.socket.sendall(msg.encode(ENCODING))
                 except Exception as e:
-                    self.append_text(f"[系统] 发送失败: {e}\n", "red")
+                    self._add_bubble("[系统]", f"发送失败: {e}", "")
+                    return
+                # 本地回显
+                if self.current_chat == target:
+                    self._add_bubble(self.username, msg_content, ts)
+                # 确保目标在左侧列表
+                if target not in self._conv_partners:
+                    self._conv_partners.append(target)
+                    self._rebuild_conv_list()
                 return
             else:
-                self.append_text("[系统] 私聊格式: @用户名 消息内容\n", "red")
+                self._add_bubble("[系统]", "私聊格式: @用户名 消息内容", "")
                 return
 
         # 公聊
-        msg = make_message(TYPE_BROADCAST, content=content)
+        ts = datetime.now(timezone.utc).isoformat()
+        msg = make_message(TYPE_BROADCAST, content=content, timestamp=ts)
         try:
             self.socket.sendall(msg.encode(ENCODING))
         except Exception as e:
-            self.append_text(f"[系统] 发送失败: {e}\n", "red")
+            self._add_bubble("[系统]", f"发送失败: {e}", "")
             return
-        # 本地回声：服务端广播排除了发送者，需要自己显示
-        self.append_text(f"[{self.username}] {content}\n")
-
-    def start_private_chat(self, event=None):
-        """双击在线用户发起私聊"""
-        selection = self.user_listbox.curselection()
-        if not selection:
-            return
-        display = self.user_listbox.get(selection[0])  # "● username"
-        target = display[2:]  # 去掉 "● "
-        if target == self.username:
-            return
-        text = simpledialog.askstring("私聊", f"发送给 {target}:")
-        if text and text.strip():
-            self.entry_msg.delete(0, "end")
-            self.entry_msg.insert(0, f"@{target} {text.strip()}")
-            self.send_message()
+        # 本地回显（公聊不排除自己，回声只在当前公聊显示）
+        self._add_bubble(self.username, content, ts)
 
     # ========================
     #  关闭窗口
