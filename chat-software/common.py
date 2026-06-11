@@ -51,3 +51,24 @@ def make_response(status, message=""):
 def make_system_msg(content):
     """构系统广播消息"""
     return make_message(TYPE_BROADCAST, content=content, sender="[系统]")
+
+
+# === 历史消息相关常量 ===
+TYPE_GET_HISTORY = "get_history"   # 客户端→服务端, {"target": "public" | "alice"}
+TYPE_HISTORY     = "history"       # 服务端→客户端, {"target": "...", "messages": [...]}
+
+MAX_HISTORY = 50                   # 每次拉取历史条数
+MAX_MESSAGES_PER_CHAT = 500        # 每个会话最多保留条数
+
+
+# === 时间戳与工具函数 ===
+from datetime import datetime, timezone
+
+def now_iso():
+    """返回当前 UTC 时间的 ISO 格式字符串"""
+    return datetime.now(timezone.utc).isoformat()
+
+def conversation_key(user1, user2):
+    """私聊会话的唯一 key：两个用户名按字母序用 : 连接"""
+    a, b = (user1, user2) if user1 < user2 else (user2, user1)
+    return f"{a}:{b}"
