@@ -185,7 +185,11 @@ class ChatServer:
                 if not chunk:
                     return
                 header += chunk
-            file_id = header.decode(ENCODING).strip()
+            # 取 \n 之前的部分作为 file_id，之后的部分是文件数据的开头
+            idx = header.index(b"\n")
+            file_id = header[:idx].decode(ENCODING).strip()
+            rest = header[idx + 1:]
+            rest_data = [rest] if rest else []  # list of leftover chunks
 
             filepath = os.path.join("files", file_id)
             # 文件已上传到磁盘 → 下载模式；否则 → 上传模式
@@ -201,6 +205,11 @@ class ChatServer:
                 # 上传模式
                 received_size = 0
                 with open(filepath, "wb") as f:
+                    # 先写入 header 中残留的数据
+                    for buf in rest_data:
+                        if buf:
+                            f.write(buf)
+                            received_size += len(buf)
                     while True:
                         chunk = client.recv(FILE_CHUNK)
                         if not chunk:
