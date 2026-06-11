@@ -593,6 +593,45 @@ class ChatWindow:
         elif msg_type == TYPE_RESPONSE:
             pass  # 登录/注册响应已在 LoginWindow 处理，忽略
 
+    def _show_emoji_panel(self):
+        """弹出 emoji 选择面板"""
+        panel = tk.Toplevel(self.root)
+        panel.title("")
+        panel.overrideredirect(True)
+        panel.attributes("-topmost", True)
+        panel.configure(bg=WHITE)
+
+        # 计算位置（在 emoji 按钮上方弹出）
+        x = self.emoji_btn.winfo_rootx()
+        y = self.emoji_btn.winfo_rooty() - 200
+        panel.geometry(f"240x300+{x}+{y}")
+
+        # 6 列 x 9 行 emoji 网格
+        cols = 6
+        for i, em in enumerate(EMOJI_LIST):
+            row = i // cols
+            col = i % cols
+            btn = tk.Button(panel, text=em, font=(FONT_FAMILY, 12),
+                           bg=WHITE, relief=tk.FLAT, cursor="hand2",
+                           command=lambda e=em: self._insert_emoji(e, panel))
+            btn.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            for c in range(cols):
+                panel.grid_columnconfigure(c, weight=1)
+
+        # 点击面板外部关闭
+        def on_focus_out(event):
+            if event.widget == panel:
+                panel.destroy()
+        panel.bind("<FocusOut>", on_focus_out)
+        panel.focus_set()
+
+    def _insert_emoji(self, emoji, panel):
+        """将 emoji 插入输入框并关闭面板"""
+        pos = self.entry_msg.index(tk.INSERT)
+        self.entry_msg.insert(pos, emoji)
+        panel.destroy()
+        self.entry_msg.focus_set()
+
     # ========================
     #  发送消息
     # ========================
