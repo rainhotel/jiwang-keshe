@@ -4,13 +4,14 @@
 """
 
 import json
+import os
 import socket
 import threading
 import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, filedialog
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
@@ -19,6 +20,8 @@ from common import (
     TYPE_GET_HISTORY, TYPE_HISTORY,
     TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
     TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
+    TYPE_FILE_SEND, TYPE_FILE_NOTIFY, TYPE_FILE_DOWNLOAD,
+    FILE_PORT, FILE_CHUNK,
     STATUS_OK, STATUS_ERROR,
     make_message, parse_message, conversation_key, group_key,
 )
@@ -361,6 +364,11 @@ class ChatWindow:
                                     command=self._show_emoji_panel, bg=BG_COLOR, fg=BLACK,
                                     font=(FONT_FAMILY, 12), relief=tk.FLAT, cursor="hand2")
         self.emoji_btn.pack(side=tk.RIGHT, ipady=2)
+
+        self.attach_btn = tk.Button(self.input_frame, text="📎", width=4,
+                                     command=self._send_file, bg=BG_COLOR, fg=BLACK,
+                                     font=(FONT_FAMILY, 12), relief=tk.FLAT, cursor="hand2")
+        self.attach_btn.pack(side=tk.RIGHT, ipady=2)
 
     def _wrap_text(self, text, max_width):
         """将文本按像素宽度换行"""
@@ -729,6 +737,11 @@ class ChatWindow:
                     self._groups.append(group_data)
                 self._rebuild_conv_list()
                 self.root.after(100, lambda gid=group_data['id']: self._switch_to(f"group:{gid}"))
+            # 文件发送响应
+            file_id = msg.get("file_id")
+            if file_id and self._pending_upload:
+                self._do_file_upload(file_id, self._pending_upload)
+                self._pending_upload = None
 
         elif msg_type == TYPE_GROUP_USERS:
             users = msg.get("users", [])
@@ -783,6 +796,76 @@ class ChatWindow:
         self.entry_msg.insert(pos, emoji)
         panel.destroy()
         self.entry_msg.focus_set()
+
+    def _send_file(self):
+        """选择文件并发送"""
+        filepath = filedialog.askopenfilename(parent=self.root, title="选择文件")
+        if not filepath:
+            return
+        filename = os.path.basename(filepath)
+        fsize = os.path.getsize(filepath)
+
+        receiver = self.current_chat if not self.current_chat.startswith("group:") and self.current_chat != "public" else self.username
+        try:
+            self.socket.sendall(
+                make_message(TYPE_FILE_SEND, receiver=receiver, filename=filename, size=fsize).encode(ENCODING)
+            )
+        except Exception as e:
+            self._add_bubble("[系统]", f"发送文件失败: {e}", "")
+            return
+        self._pending_upload = {"filepath": filepath, "filename": filename, "fsize": fsize, "receiver": receiver}
+
+    def _do_file_upload(self, file_id, info):
+        """启动上传线程"""
+        def upload():
+            try:
+                fs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                fs.settimeout(30)
+                fs.connect((DEFAULT_HOST, FILE_PORT))
+                fs.sendall((file_id + "\n").encode(ENCODING))
+                with open(info["filepath"], "rb") as f:
+                    while True:
+                        chunk = f.read(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        fs.sendall(chunk)
+                fs.close()
+                self.root.after(0, lambda: self._render_file_card(
+                    self.username, info["filename"], info["fsize"], file_id, True,
+                ))
+            except Exception as e:
+                self._add_bubble("[系统]", f"上传文件失败: {e}", "")
+        threading.Thread(target=upload, daemon=True).start()
+
+    def _render_file_card(self, sender, filename, fsize, file_id, is_sender):
+        """渲染文件卡片气泡"""
+        is_me = (sender == self.username)
+        bubble_bg = GREEN_BUBBLE if is_me else WHITE
+        size_str = f"{fsize:,} B" if fsize < 1024 else f"{fsize/1024:.1f} KB"
+
+        outer = tk.Frame(self.bubble_frame, bg=BG_COLOR)
+        if is_me:
+            outer.pack(anchor="e", pady=1, padx=(40, 6))
+        else:
+            outer.pack(anchor="w", pady=1, padx=(6, 40))
+
+        inner = tk.Frame(outer, bg=bubble_bg, padx=10, pady=6)
+        inner.pack()
+
+        tk.Label(inner, text=f"📄 {filename}", font=self.bubble_font,
+                bg=bubble_bg, fg=BLACK).pack(anchor="w")
+        tk.Label(inner, text=size_str, font=self.time_font,
+                bg=bubble_bg, fg=GRAY).pack(anchor="w")
+
+        if not is_sender:
+            self._file_progress = tk.StringVar(value="下载")
+            btn = tk.Button(inner, textvariable=self._file_progress,
+                           font=self.time_font, relief=tk.GROOVE, cursor="hand2",
+                           command=lambda: self._download_file(file_id, filename))
+            btn.pack(pady=(4, 0))
+            inner._download_btn = btn
+
+        self._scroll_to_bottom()
 
     # ========================
     #  发送消息
