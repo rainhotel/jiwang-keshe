@@ -7,15 +7,28 @@ import json
 import socket
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
+from datetime import datetime, timezone
 from tkinter import scrolledtext, messagebox, simpledialog
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
     TYPE_REGISTER, TYPE_LOGIN, TYPE_BROADCAST, TYPE_PRIVATE,
     TYPE_GET_USERS, TYPE_SYSTEM, TYPE_RESPONSE,
+    TYPE_GET_HISTORY, TYPE_HISTORY,
     STATUS_OK, STATUS_ERROR,
     make_message, parse_message,
 )
+
+# 微信风格配色
+BG_COLOR = "#F5F5F5"
+LEFT_BG = "#EBEBEB"
+WHITE = "#FFFFFF"
+GREEN_BUBBLE = "#95EC69"
+BLACK = "#000000"
+GRAY = "#999999"
+BLUE_SYSTEM = "#888888"
+FONT_FAMILY = "微软雅黑"
 
 
 # ============================
@@ -179,56 +192,39 @@ class LoginWindow:
 #  聊天主窗口
 # ============================
 class ChatWindow:
-    def __init__(self, socket_conn, username):
+    def __init__(self, socket_conn, username, public_history=None, conversations=None):
         self.socket = socket_conn
         self.username = username
         self.running = True
+        self.current_chat = "public"
+        self.online_users = set()
+        self._conv_partners = list(conversations) if conversations else []
+        self.bubble_font = tkfont.Font(family=FONT_FAMILY, size=10)
+        self.time_font = tkfont.Font(family=FONT_FAMILY, size=8)
 
         self.root = tk.Tk()
         self.root.title(f"局域网聊天 - {username}")
-        self.root.geometry("700x500")
+        self.root.geometry("800x550")
+        self.root.configure(bg=BG_COLOR)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # 左侧聊天区域
-        frm_chat = tk.Frame(self.root)
-        frm_chat.pack(side="left", fill="both", expand=True, padx=(5, 0), pady=5)
+        # PanedWindow 分左右
+        self.paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
+                                     sashrelief=tk.RAISED, sashwidth=1, bg=BG_COLOR)
+        self.paned.pack(fill=tk.BOTH, expand=True)
 
-        self.chat_display = scrolledtext.ScrolledText(
-            frm_chat, state="disabled", wrap="word", font=("微软雅黑", 10)
-        )
-        self.chat_display.pack(fill="both", expand=True)
+        self._build_left_panel()
+        self._build_right_panel()
 
-        # 输入区域
-        frm_input = tk.Frame(frm_chat)
-        frm_input.pack(fill="x", pady=(3, 0))
-        self.entry_msg = tk.Entry(frm_input, font=("微软雅黑", 10))
-        self.entry_msg.pack(side="left", fill="x", expand=True)
-        self.entry_msg.bind("<Return>", self.send_message)
-        tk.Button(frm_input, text="发送", width=8, command=self.send_message).pack(side="right", padx=(3, 0))
+        # 会话列表初始渲染
+        self._rebuild_conv_list()
+        self.conv_listbox.selection_set(0)
 
-        # 右侧面板
-        frm_right = tk.Frame(self.root, width=160)
-        frm_right.pack(side="right", fill="y", padx=(5, 5), pady=5)
-        frm_right.pack_propagate(False)
+        # 加载公聊历史
+        if public_history:
+            self._render_history(public_history)
 
-        # 在线用户
-        lbl_online = tk.Label(frm_right, text="在线用户", font=("微软雅黑", 10, "bold"))
-        lbl_online.pack()
-        self.user_listbox = tk.Listbox(frm_right, font=("微软雅黑", 9))
-        self.user_listbox.pack(fill="both", expand=True, pady=3)
-        self.user_listbox.bind("<Double-Button-1>", self.start_private_chat)
-
-        # 帮助
-        lbl_help = tk.Label(
-            frm_right,
-            text="双击用户发起私聊\n直接发送为公聊\n@用户名 消息 为私聊",
-            font=("微软雅黑", 8),
-            fg="gray",
-            justify="left",
-        )
-        lbl_help.pack(pady=5)
-
-        # 启动接收线程
+        # 接收线程
         self.recv_thread = threading.Thread(target=self.receive_loop, daemon=True)
         self.recv_thread.start()
 
@@ -239,8 +235,128 @@ class ChatWindow:
         y = (self.root.winfo_screenheight() - h) // 2
         self.root.geometry(f"+{x}+{y}")
 
-        self.append_text("[系统] 欢迎来到聊天室！\n", "blue")
         self.refresh_users()
+
+    def _build_left_panel(self):
+        self.left_frame = tk.Frame(self.paned, width=200, bg=LEFT_BG)
+        self.paned.add(self.left_frame, minsize=150)
+        self.left_frame.pack_propagate(False)
+
+        # 搜索框
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self._filter_conversations())
+        self.search_entry = tk.Entry(self.left_frame, textvariable=self.search_var,
+                                      font=(FONT_FAMILY, 9), fg=GRAY)
+        self.search_entry.insert(0, "搜索")
+        self.search_entry.bind("<FocusIn>", lambda e: self._on_search_focus_in())
+        self.search_entry.bind("<FocusOut>", lambda e: self._on_search_focus_out())
+        self.search_entry.pack(fill="x", padx=8, pady=(8, 4))
+
+        # 会话列表
+        self.conv_listbox = tk.Listbox(self.left_frame, font=(FONT_FAMILY, 10),
+                                        bg=LEFT_BG, fg=BLACK, selectmode=tk.SINGLE,
+                                        activestyle="none", border=0, highlightthickness=0,
+                                        exportselection=False)
+        self.conv_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 8))
+        self.conv_listbox.bind("<<ListboxSelect>>", self._on_conversation_select)
+
+    def _build_right_panel(self):
+        self.right_frame = tk.Frame(self.paned, bg=BG_COLOR)
+        self.paned.add(self.right_frame, minsize=400)
+
+        # 标题栏
+        self.title_bar = tk.Frame(self.right_frame, height=44, bg=BG_COLOR)
+        self.title_bar.pack(fill="x", padx=12, pady=(8, 0))
+        self.title_bar.pack_propagate(False)
+        self.title_label = tk.Label(self.title_bar, text="公聊大厅",
+                                     font=(FONT_FAMILY, 12, "bold"), bg=BG_COLOR, fg=BLACK)
+        self.title_label.pack(side="left", pady=6)
+
+        # 分割线
+        sep = tk.Frame(self.right_frame, height=1, bg="#E0E0E0")
+        sep.pack(fill="x", padx=12)
+
+        # 聊天气泡区 (Canvas + Scrollbar)
+        self.chat_container = tk.Frame(self.right_frame, bg=BG_COLOR)
+        self.chat_container.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        self.chat_canvas = tk.Canvas(self.chat_container, bg=BG_COLOR, highlightthickness=0)
+        self.chat_scrollbar = tk.Scrollbar(self.chat_container, orient=tk.VERTICAL,
+                                            command=self.chat_canvas.yview)
+        self.chat_canvas.configure(yscrollcommand=self.chat_scrollbar.set)
+
+        self.chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Canvas 内部 frame 用于放置气泡
+        self.bubble_frame = tk.Frame(self.chat_canvas, bg=BG_COLOR)
+        self.bubble_frame.bind("<Configure>",
+            lambda e: self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all")))
+        self.canvas_window = self.chat_canvas.create_window((0, 0), window=self.bubble_frame,
+                                                             anchor="nw", tags="bubble_frame")
+        self.chat_canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # 鼠标滚轮
+        self.chat_canvas.bind("<Enter>", lambda e: self._bind_mousewheel())
+        self.chat_canvas.bind("<Leave>", lambda e: self._unbind_mousewheel())
+
+        # 输入区
+        self.input_frame = tk.Frame(self.right_frame, bg=BG_COLOR, height=50)
+        self.input_frame.pack(fill="x", padx=12, pady=(4, 10))
+        self.input_frame.pack_propagate(False)
+
+        self.entry_msg = tk.Entry(self.input_frame, font=(FONT_FAMILY, 10),
+                                   bg=WHITE, relief=tk.FLAT)
+        self.entry_msg.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        self.entry_msg.bind("<Return>", self.send_message)
+
+        self.send_btn = tk.Button(self.input_frame, text="发送", width=8,
+                                   command=self.send_message, bg="#2DC100", fg=WHITE,
+                                   font=(FONT_FAMILY, 9), relief=tk.FLAT, cursor="hand2")
+        self.send_btn.pack(side=tk.RIGHT, padx=(6, 0), ipady=2)
+
+    def _on_canvas_resize(self, event):
+        self.chat_canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _bind_mousewheel(self):
+        self.chat_canvas.bind_all("<MouseWheel>",
+            lambda e: self.chat_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+    def _unbind_mousewheel(self):
+        self.chat_canvas.unbind_all("<MouseWheel>")
+
+    def _scroll_to_bottom(self):
+        self.chat_canvas.after(50, lambda: self.chat_canvas.yview_moveto(1.0))
+
+    def _rebuild_conv_list(self):
+        def _rebuild():
+            self.conv_listbox.delete(0, tk.END)
+            self.conv_listbox.insert(tk.END, "★ 公聊大厅")
+            for p in self._conv_partners:
+                self.conv_listbox.insert(tk.END, f"  {p}")
+        self.root.after(0, _rebuild)
+
+    def _render_history(self, messages):
+        pass  # Will be implemented in Task 5
+
+    def _on_conversation_select(self, event=None):
+        pass  # Will be implemented in Task 6
+
+    def _filter_conversations(self):
+        pass  # Will be implemented in Task 6
+
+    def _on_search_focus_in(self):
+        if self.search_var.get() == "搜索":
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.config(fg=BLACK)
+
+    def _on_search_focus_out(self):
+        if not self.search_var.get().strip():
+            self.search_entry.insert(0, "搜索")
+            self.search_entry.config(fg=GRAY)
+
+    def refresh_users(self):
+        pass  # Will be implemented in Task 6
 
     # ========================
     #  界面更新（线程安全）
@@ -254,14 +370,6 @@ class ChatWindow:
             self.chat_display.config(state="disabled")
         self.root.after(0, _append)
 
-    def refresh_users(self):
-        """请求并刷新在线用户列表"""
-        try:
-            self.socket.sendall(
-                make_message(TYPE_GET_USERS).encode(ENCODING)
-            )
-        except Exception:
-            pass
 
     def update_user_list(self, users):
         """更新右侧在线用户列表"""
@@ -397,5 +505,9 @@ if __name__ == "__main__":
     login.run()
 
     if login.username and login.socket:
-        chat = ChatWindow(login.socket, login.username)
+        chat = ChatWindow(
+            login.socket, login.username,
+            public_history=getattr(login, '_login_public_history', []),
+            conversations=getattr(login, '_login_conversations', []),
+        )
         chat.run()
