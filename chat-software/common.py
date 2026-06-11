@@ -72,3 +72,15 @@ def conversation_key(user1, user2):
     """私聊会话的唯一 key：两个用户名按字母序用 : 连接"""
     a, b = (user1, user2) if user1 < user2 else (user2, user1)
     return f"{a}:{b}"
+
+def group_key(group_id):
+    """群聊 chat_key"""
+    return f"group:{group_id}"
+
+# === 群聊相关常量 ===
+TYPE_CREATE_GROUP = "create_group"
+TYPE_JOIN_GROUP   = "join_group"
+TYPE_LEAVE_GROUP  = "leave_group"
+TYPE_DELETE_GROUP = "delete_group"
+TYPE_GROUP_USERS  = "group_users"
+TYPE_GROUP_MSG    = "group_msg"

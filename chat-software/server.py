@@ -15,10 +15,12 @@ from common import (
     TYPE_REGISTER, TYPE_LOGIN, TYPE_BROADCAST, TYPE_PRIVATE,
     TYPE_GET_USERS, TYPE_RESPONSE, TYPE_SYSTEM,
     TYPE_GET_HISTORY, TYPE_HISTORY,
+    TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
+    TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
     MAX_HISTORY, MAX_MESSAGES_PER_CHAT,
     STATUS_OK, STATUS_ERROR,
     make_message, parse_message, make_response, make_system_msg,
-    now_iso, conversation_key,
+    now_iso, conversation_key, group_key,
 )
 
 DB_FILE = "chat.db"
@@ -67,6 +69,22 @@ class ChatServer:
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp
             ON messages(chat_key, timestamp)
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id  INTEGER,
+                username  TEXT,
+                joined_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, username)
+            )
         """)
         self.conn.commit()
 
