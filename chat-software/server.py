@@ -7,6 +7,7 @@ import socket
 import threading
 import json
 import os
+import time
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
@@ -19,6 +20,11 @@ from common import (
 USERS_FILE = "users.json"
 
 
+def _ts():
+    """返回带时间戳的前缀，用于日志"""
+    return time.strftime("[%H:%M:%S]")
+
+
 class ChatServer:
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT):
         self.host = host
@@ -26,7 +32,7 @@ class ChatServer:
         self.server_socket = None
         # {username: {"password": str, "addr": tuple}}
         self.clients = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # 可重入锁，避免 _save_users 内部死锁
         self._load_users()
 
     # ========================
@@ -44,11 +50,9 @@ class ChatServer:
             print("[服务器] 用户数据文件不存在，将创建新文件")
 
     def _save_users(self):
-        """持久化已注册用户（仅保存密码）"""
-        data = {}
+        """持久化已注册用户（仅保存密码）。调用方可以持有锁，本方法会自行加锁。"""
         with self.lock:
-            for u, info in self.clients.items():
-                data[u] = info["password"]
+            data = {u: info["password"] for u, info in self.clients.items()}
         with open(USERS_FILE, "w", encoding=ENCODING) as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -97,28 +101,43 @@ class ChatServer:
     #  客户端处理
     # ========================
     def handle_client(self, client_socket, addr):
-        """处理单个客户端连接"""
+        """处理单个客户端连接，处理 TCP 粘包"""
         username = None
+        buffer = ""
+        decoder = json.JSONDecoder()
+        print(f"{_ts()} [线程-{threading.current_thread().name}] handle_client 开始: {addr}")
 
         try:
             while True:
+                print(f"{_ts()} [线程-{threading.current_thread().name}] 等待 recv...")
                 data = client_socket.recv(BUFFER_SIZE)
                 if not data:
+                    print(f"{_ts()} [线程-{threading.current_thread().name}] recv 返回空, 客户端关闭连接")
                     break
 
-                msg = parse_message(data.decode(ENCODING))
-                if msg is None:
-                    client_socket.sendall(
-                        make_response(STATUS_ERROR, "消息格式错误").encode(ENCODING)
-                    )
-                    continue
+                buffer += data.decode(ENCODING)
+                print(f"{_ts()} [线程-{threading.current_thread().name}] recv 收到 {len(data)} 字节, buffer={len(buffer)}字节")
 
-                msg_type = msg.get("type")
-                username = self._dispatch(msg_type, msg, client_socket, addr, username)
+                # 循环解析 buffer 中的所有完整 JSON 对象
+                while buffer:
+                    stripped = buffer.lstrip()
+                    if not stripped:
+                        buffer = ""
+                        break
+                    try:
+                        obj, end = decoder.raw_decode(stripped)
+                        buffer = stripped[end:]
+                    except json.JSONDecodeError:
+                        break  # 数据不完整，等下次 recv
 
-        except (ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
+                    msg_type = obj.get("type")
+                    print(f"{_ts()} [线程-{threading.current_thread().name}] 消息类型={msg_type}, 内容={obj}")
+                    username = self._dispatch(msg_type, obj, client_socket, addr, username)
+
+        except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            print(f"{_ts()} [线程-{threading.current_thread().name}] 连接异常: {e}")
         finally:
+            print(f"{_ts()} [线程-{threading.current_thread().name}] handle_client 结束: user={username}")
             self._disconnect_client(username, client_socket)
 
     def _dispatch(self, msg_type, msg, client_socket, addr, current_user):
@@ -146,8 +165,10 @@ class ChatServer:
     def _handle_register(self, msg, client_socket):
         username = msg.get("username", "").strip()
         password = msg.get("password", "").strip()
+        print(f"{_ts()} _handle_register: username='{username}', password='{'***' if password else ''}'")
 
         if not username or not password:
+            print(f"{_ts()} _handle_register: 用户名或密码为空 → 返回错误")
             client_socket.sendall(
                 make_response(STATUS_ERROR, "用户名和密码不能为空").encode(ENCODING)
             )
@@ -155,6 +176,7 @@ class ChatServer:
 
         with self.lock:
             if username in self.clients:
+                print(f"{_ts()} _handle_register: 用户名 '{username}' 已存在 → 返回错误")
                 client_socket.sendall(
                     make_response(STATUS_ERROR, "用户名已存在").encode(ENCODING)
                 )
@@ -162,10 +184,11 @@ class ChatServer:
             self.clients[username] = {"password": password, "addr": None, "socket": None}
             self._save_users()
 
+        print(f"{_ts()} _handle_register: 注册成功 '{username}' → 发送响应")
         client_socket.sendall(
             make_response(STATUS_OK, "注册成功").encode(ENCODING)
         )
-        print(f"[服务器] 新用户注册: {username}")
+        print(f"{_ts()} _handle_register: 响应已发送")
         return None
 
     # ========================
@@ -174,8 +197,10 @@ class ChatServer:
     def _handle_login(self, msg, client_socket, addr):
         username = msg.get("username", "").strip()
         password = msg.get("password", "").strip()
+        print(f"{_ts()} _handle_login: username='{username}', password='{'***' if password else ''}'")
 
         if not username or not password:
+            print(f"{_ts()} _handle_login: 用户名或密码为空 → 返回错误")
             client_socket.sendall(
                 make_response(STATUS_ERROR, "用户名和密码不能为空").encode(ENCODING)
             )
@@ -183,16 +208,19 @@ class ChatServer:
 
         with self.lock:
             if username not in self.clients:
+                print(f"{_ts()} _handle_login: 用户 '{username}' 不存在 → 返回错误")
                 client_socket.sendall(
                     make_response(STATUS_ERROR, "用户不存在，请先注册").encode(ENCODING)
                 )
                 return None
             if self.clients[username]["password"] != password:
+                print(f"{_ts()} _handle_login: 密码错误 → 返回错误")
                 client_socket.sendall(
                     make_response(STATUS_ERROR, "密码错误").encode(ENCODING)
                 )
                 return None
             if self.clients[username].get("addr") is not None:
+                print(f"{_ts()} _handle_login: 用户 '{username}' 已在线 → 返回错误")
                 client_socket.sendall(
                     make_response(STATUS_ERROR, "该用户已在线").encode(ENCODING)
                 )
@@ -202,13 +230,14 @@ class ChatServer:
             self.clients[username]["addr"] = addr
             self.clients[username]["socket"] = client_socket
 
+        print(f"{_ts()} _handle_login: 登录成功 '{username}' → 发送响应")
         client_socket.sendall(
             make_response(STATUS_OK, "登录成功").encode(ENCODING)
         )
+        print(f"{_ts()} _handle_login: 响应已发送, 广播上线通知")
 
         # 广播上线通知
         self.broadcast(f"{username} 加入了聊天室", system=True, exclude=username)
-        print(f"[服务器] 用户登录: {username} ({addr})")
         return username
 
     # ========================

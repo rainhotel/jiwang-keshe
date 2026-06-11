@@ -3,6 +3,7 @@
 功能：连接服务器、注册/登录、公聊、私聊、在线用户列表
 """
 
+import json
 import socket
 import threading
 import tkinter as tk
@@ -69,75 +70,105 @@ class LoginWindow:
         y = (self.root.winfo_screenheight() - h) // 2
         self.root.geometry(f"+{x}+{y}")
 
-    def connect(self):
-        """连接服务器"""
-        host = self.entry_host.get().strip()
+    # ========================
+    #  网络操作（静态方法，在后台线程中调用）
+    # ========================
+    @staticmethod
+    def _connect(host, port_str):
+        """连接服务器，返回 (socket, error_msg) — 不访问任何 tkinter 控件"""
         try:
-            port = int(self.entry_port.get().strip())
+            port = int(port_str)
         except ValueError:
-            messagebox.showerror("错误", "端口号必须为数字")
-            return False
-
+            return None, "端口号必须为数字"
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(5)
-            self.socket.connect((host, port))
-            self.socket.settimeout(None)
-            return True
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((host, port))
+            sock.settimeout(10)
+            return sock, None
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
-            messagebox.showerror("错误", f"无法连接到服务器: {e}")
-            return False
+            return None, f"无法连接到服务器: {e}"
 
-    def send_and_recv(self, msg_str):
-        """发送消息并等待响应"""
+    @staticmethod
+    def _send_and_recv(sock, msg_str):
+        """发送消息并等待响应，返回 (resp_dict, error_msg) — 不访问任何 tkinter 控件"""
         try:
-            self.socket.sendall(msg_str.encode(ENCODING))
-            data = self.socket.recv(BUFFER_SIZE)
-            return parse_message(data.decode(ENCODING))
+            sock.sendall(msg_str.encode(ENCODING))
+            data = sock.recv(BUFFER_SIZE)
+            resp = parse_message(data.decode(ENCODING))
+            if resp is None:
+                return None, "服务器返回了无效数据"
+            return resp, None
+        except socket.timeout:
+            return None, "服务器响应超时，请确认服务端已启动"
         except Exception as e:
-            messagebox.showerror("错误", f"通信异常: {e}")
-            return None
+            return None, f"通信异常: {e}"
 
+    # ========================
+    #  登录 / 注册（主线程读取控件值 → 后台线程执行网络操作）
+    # ========================
     def do_login(self):
+        # 在主线程中读取所有 tkinter 控件值
+        host = self.entry_host.get().strip()
+        port = self.entry_port.get().strip()
         username = self.entry_user.get().strip()
         password = self.entry_pass.get().strip()
         if not username or not password:
             messagebox.showwarning("提示", "请输入用户名和密码")
             return
-        if not self.connect():
-            return
-        resp = self.send_and_recv(make_message(TYPE_LOGIN, username=username, password=password))
-        if resp and resp.get("status") == STATUS_OK:
-            self.username = username
-            self.root.destroy()  # 关闭登录窗口
-        elif resp:
-            messagebox.showerror("登录失败", resp.get("message", "未知错误"))
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+
+        def _run():
+            sock, err = self._connect(host, port)
+            if sock is None:
+                self.root.after(0, lambda e=err: messagebox.showerror("错误", e))
+                return
+            resp, err = self._send_and_recv(
+                sock, make_message(TYPE_LOGIN, username=username, password=password)
+            )
+            if resp and resp.get("status") == STATUS_OK:
+                sock.settimeout(None)  # 聊天窗口需要长期保持连接，取消超时
+                self.socket = sock
+                self.username = username
+                self.root.after(0, self.root.destroy)
+            else:
+                msg = resp.get("message", "") if resp else err
+                self.root.after(0, lambda m=msg: messagebox.showerror("登录失败", m))
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def do_register(self):
+        # 在主线程中读取所有 tkinter 控件值
+        host = self.entry_host.get().strip()
+        port = self.entry_port.get().strip()
         username = self.entry_user.get().strip()
         password = self.entry_pass.get().strip()
         if not username or not password:
             messagebox.showwarning("提示", "请输入用户名和密码")
             return
-        if not self.connect():
-            return
-        resp = self.send_and_recv(make_message(TYPE_REGISTER, username=username, password=password))
-        if resp and resp.get("status") == STATUS_OK:
-            messagebox.showinfo("成功", "注册成功！请登录")
+
+        def _run():
+            sock, err = self._connect(host, port)
+            if sock is None:
+                self.root.after(0, lambda e=err: messagebox.showerror("错误", e))
+                return
+            resp, err = self._send_and_recv(
+                sock, make_message(TYPE_REGISTER, username=username, password=password)
+            )
+            if resp and resp.get("status") == STATUS_OK:
+                self.root.after(0, lambda: messagebox.showinfo("成功", "注册成功！请登录"))
+            else:
+                msg = resp.get("message", "") if resp else err
+                self.root.after(0, lambda m=msg: messagebox.showerror("注册失败", m))
             try:
-                self.socket.close()
+                sock.close()
             except Exception:
                 pass
-        elif resp:
-            messagebox.showerror("注册失败", resp.get("message", "未知错误"))
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def run(self):
         self.root.mainloop()
@@ -245,8 +276,9 @@ class ChatWindow:
     #  消息接收循环
     # ========================
     def receive_loop(self):
-        """后台线程：持续接收服务器消息"""
+        """后台线程：持续接收服务器消息，处理 TCP 粘包"""
         buffer = ""
+        decoder = json.JSONDecoder()
         while self.running:
             try:
                 data = self.socket.recv(BUFFER_SIZE)
@@ -255,13 +287,18 @@ class ChatWindow:
                     break
                 buffer += data.decode(ENCODING)
 
-                # 按换行拆分多条JSON（simple protocol: each msg is one line）
-                # 由于我们用的是单条JSON（无换行），这里按}后跟{来拆分
-                # 简化为按单条JSON处理
-                msg = parse_message(buffer)
-                if msg:
-                    buffer = ""
-                    self._handle_message(msg)
+                # 循环解析 buffer 中的所有完整 JSON 对象
+                while buffer:
+                    stripped = buffer.lstrip()
+                    if not stripped:
+                        buffer = ""
+                        break
+                    try:
+                        obj, end = decoder.raw_decode(stripped)
+                        buffer = stripped[end:]
+                        self._handle_message(obj)
+                    except json.JSONDecodeError:
+                        break  # 数据不完整，等下次 recv
             except (ConnectionResetError, ConnectionAbortedError, OSError):
                 if self.running:
                     self.append_text("[系统] 与服务器断开连接\n", "red")
@@ -318,6 +355,9 @@ class ChatWindow:
             self.socket.sendall(msg.encode(ENCODING))
         except Exception as e:
             self.append_text(f"[系统] 发送失败: {e}\n", "red")
+            return
+        # 本地回声：服务端广播排除了发送者，需要自己显示
+        self.append_text(f"[{self.username}] {content}\n")
 
     def start_private_chat(self, event=None):
         """双击在线用户发起私聊"""
