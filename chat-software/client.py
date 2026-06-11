@@ -17,7 +17,7 @@ from common import (
     TYPE_GET_USERS, TYPE_SYSTEM, TYPE_RESPONSE,
     TYPE_GET_HISTORY, TYPE_HISTORY,
     STATUS_OK, STATUS_ERROR,
-    make_message, parse_message,
+    make_message, parse_message, conversation_key,
 )
 
 # 微信风格配色
@@ -142,6 +142,8 @@ class LoginWindow:
                 sock.settimeout(None)  # 聊天窗口需要长期保持连接，取消超时
                 self.socket = sock
                 self.username = username
+                self._login_public_history = resp.get("public_history", [])
+                self._login_conversations = resp.get("conversations", [])
                 self.root.after(0, self.root.destroy)
             else:
                 msg = resp.get("message", "") if resp else err
@@ -216,9 +218,13 @@ class ChatWindow:
         self._build_left_panel()
         self._build_right_panel()
 
-        # 会话列表初始渲染
-        self._rebuild_conv_list()
+        # 会话列表初始渲染（同步填充，不等 after 回调）
+        self.conv_listbox.delete(0, tk.END)
+        self.conv_listbox.insert(tk.END, "★ 公聊大厅")
+        for p in self._conv_partners:
+            self.conv_listbox.insert(tk.END, f"  {p}")
         self.conv_listbox.selection_set(0)
+        self._on_conversation_select()
 
         # 加载公聊历史
         if public_history:
@@ -555,7 +561,14 @@ class ChatWindow:
                 self._rebuild_conv_list()
 
         elif msg_type == TYPE_HISTORY:
-            self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
+            resp_target = msg.get("target", "")
+            # 只渲染当前会话的历史，避免快速切换时显示错乱
+            if resp_target == "public" and self.current_chat == "public":
+                self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
+            elif resp_target != "public":
+                users = resp_target.split(":")
+                if self.current_chat in users:
+                    self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
 
         elif msg_type == TYPE_GET_USERS:
             self._update_users(msg.get("users", []))
@@ -586,9 +599,7 @@ class ChatWindow:
                 except Exception as e:
                     self._add_bubble("[系统]", f"发送失败: {e}", "")
                     return
-                # 本地回显
-                if self.current_chat == target:
-                    self._add_bubble(self.username, msg_content, ts)
+                # 服务端会回显私聊消息给发送方，无需本地回声
                 # 确保目标在左侧列表
                 if target not in self._conv_partners:
                     self._conv_partners.append(target)

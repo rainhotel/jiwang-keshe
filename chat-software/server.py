@@ -367,7 +367,7 @@ class ChatServer:
     def private_message(self, target, content, sender):
         """发送私聊消息"""
         msg = make_message(
-            TYPE_PRIVATE, content=content, sender=target, target=sender
+            TYPE_PRIVATE, content=content, sender=sender, target=target
         )
         data = msg.encode(ENCODING)
         with self.lock:
