@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import tkinter as tk
+from tkinter import ttk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
 from tkinter import messagebox
@@ -156,6 +157,7 @@ class LoginWindow:
                 self.username = username
                 self._login_public_history = resp.get("public_history", [])
                 self._login_conversations = resp.get("conversations", [])
+                self._login_groups = resp.get("groups", [])
                 self.root.after(0, self.root.destroy)
             else:
                 msg = resp.get("message", "") if resp else err
@@ -206,13 +208,15 @@ class LoginWindow:
 #  聊天主窗口
 # ============================
 class ChatWindow:
-    def __init__(self, socket_conn, username, public_history=None, conversations=None):
+    def __init__(self, socket_conn, username, public_history=None, conversations=None, groups=None):
         self.socket = socket_conn
         self.username = username
         self.running = True
         self.current_chat = "public"
         self.online_users = set()
         self._conv_partners = list(conversations) if conversations else []
+        self._groups = groups or []
+        self._pending_upload = None
 
         self.root = tk.Tk()
         self.bubble_font = tkfont.Font(family=FONT_FAMILY, size=10)
@@ -230,13 +234,10 @@ class ChatWindow:
         self._build_left_panel()
         self._build_right_panel()
 
-        # 会话列表初始渲染（同步填充，不等 after 回调）
-        self.conv_listbox.delete(0, tk.END)
-        self.conv_listbox.insert(tk.END, "★ 公聊大厅")
-        for p in self._conv_partners:
-            self.conv_listbox.insert(tk.END, f"  {p}")
-        self.conv_listbox.selection_set(0)
-        self._on_conversation_select()
+        # 会话列表初始渲染（同步填充）
+        self._rebuild_conv_list()
+        self.conv_tree.selection_set("public")
+        self._on_tree_select()
 
         # 加载公聊历史
         if public_history:
@@ -270,13 +271,32 @@ class ChatWindow:
         self.search_entry.bind("<FocusOut>", lambda e: self._on_search_focus_out())
         self.search_entry.pack(fill="x", padx=8, pady=(8, 4))
 
-        # 会话列表
-        self.conv_listbox = tk.Listbox(self.left_frame, font=(FONT_FAMILY, 10),
-                                        bg=LEFT_BG, fg=BLACK, selectmode=tk.SINGLE,
-                                        activestyle="none", border=0, highlightthickness=0,
-                                        exportselection=False)
-        self.conv_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 8))
-        self.conv_listbox.bind("<<ListboxSelect>>", self._on_conversation_select)
+        # Treeview 替代 Listbox
+        self.conv_tree = ttk.Treeview(self.left_frame, show="tree",
+                                       selectmode="browse", height=20)
+        self.conv_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        self.conv_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # 根节点
+        self.tree_root = self.conv_tree.insert("", "end", text="", open=True, iid="root")
+
+        # 公聊大厅
+        self.tree_public = self.conv_tree.insert("root", "end", iid="public", text="★ 公聊大厅")
+
+        # 群聊父节点
+        self.tree_groups = self.conv_tree.insert("root", "end", iid="groups", text="▼ 群聊", open=True)
+        self._group_tree_ids = {}
+
+        # 联系人父节点
+        self.tree_contacts = self.conv_tree.insert("root", "end", iid="contacts", text="▼ 联系人", open=True)
+        self._contact_tree_ids = []
+
+        # 底部按钮
+        btn_frame = tk.Frame(self.left_frame, bg=LEFT_BG)
+        btn_frame.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Button(btn_frame, text="+ 创建群", font=(FONT_FAMILY, 9),
+                 bg=LEFT_BG, relief=tk.GROOVE, cursor="hand2",
+                 command=self._create_group_dialog).pack(fill="x")
 
     def _build_right_panel(self):
         self.right_frame = tk.Frame(self.paned, bg=BG_COLOR)
@@ -430,10 +450,28 @@ class ChatWindow:
 
     def _rebuild_conv_list(self):
         def _rebuild():
-            self.conv_listbox.delete(0, tk.END)
-            self.conv_listbox.insert(tk.END, "★ 公聊大厅")
+            # 清空联系人和群子节点
+            for iid in self._contact_tree_ids:
+                self.conv_tree.delete(iid)
+            self._contact_tree_ids.clear()
+            for iid in self._group_tree_ids.values():
+                self.conv_tree.delete(iid)
+            self._group_tree_ids.clear()
+
+            tree = self.conv_tree
+            # 群列表
+            for g in getattr(self, '_groups', []):
+                iid = f"group:{g['id']}"
+                self._group_tree_ids[g['id']] = tree.insert(
+                    self.tree_groups, "end", iid=iid, text=f"  {g['name']}",
+                )
+            # 联系人列表（含在线状态）
             for p in self._conv_partners:
-                self.conv_listbox.insert(tk.END, f"  {p}")
+                online = p in self.online_users
+                prefix = "● " if online else "○ "
+                iid = f"contact:{p}"
+                tree.insert(self.tree_contacts, "end", iid=iid, text=f"  {prefix}{p}")
+                self._contact_tree_ids.append(iid)
         self.root.after(0, _rebuild)
 
     def _render_history(self, messages):
@@ -452,30 +490,38 @@ class ChatWindow:
         for w in self.bubble_frame.winfo_children():
             w.destroy()
 
-    def _on_conversation_select(self, event=None):
-        selection = self.conv_listbox.curselection()
-        if not selection:
+    def _on_tree_select(self, event=None):
+        sel = self.conv_tree.selection()
+        if not sel:
             return
-        idx = selection[0]
-        if idx == 0:
+        iid = sel[0]
+        target = None
+        if iid == "public":
             self.current_chat = "public"
             self.title_label.config(text="公聊大厅")
+            target = "public"
+        elif iid.startswith("group:"):
+            gid = int(iid.split(":")[1])
+            self.current_chat = f"group:{gid}"
+            for g in getattr(self, '_groups', []):
+                if g['id'] == gid:
+                    self.title_label.config(text=g['name'])
+                    break
+            target = self.current_chat
+        elif iid.startswith("contact:"):
+            partner = iid.split(":", 1)[1]
+            self.current_chat = partner
+            self.title_label.config(text=partner)
+            target = partner
         else:
-            partner_idx = idx - 1
-            if partner_idx < len(self._conv_partners):
-                partner = self._conv_partners[partner_idx]
-                self.current_chat = partner
-                self.title_label.config(text=partner)
-            else:
-                return
-        # 请求历史
-        target = "public" if self.current_chat == "public" else self.current_chat
-        try:
-            self.socket.sendall(
-                make_message(TYPE_GET_HISTORY, target=target).encode(ENCODING)
-            )
-        except Exception:
-            pass
+            return
+        if target:
+            try:
+                self.socket.sendall(
+                    make_message(TYPE_GET_HISTORY, target=target).encode(ENCODING)
+                )
+            except Exception:
+                pass
 
     def _filter_conversations(self):
         query = self.search_var.get().strip()
@@ -483,11 +529,23 @@ class ChatWindow:
             self._rebuild_conv_list()
             return
         def _filter():
-            self.conv_listbox.delete(0, tk.END)
-            self.conv_listbox.insert(tk.END, "★ 公聊大厅")
+            for iid in self._contact_tree_ids:
+                self.conv_tree.delete(iid)
+            self._contact_tree_ids.clear()
+            for iid in self._group_tree_ids.values():
+                self.conv_tree.delete(iid)
+            self._group_tree_ids.clear()
+            for g in self._groups:
+                if query.lower() in g['name'].lower():
+                    iid = f"group:{g['id']}"
+                    self._group_tree_ids[g['id']] = self.conv_tree.insert(
+                        self.tree_groups, "end", iid=iid, text=f"  {g['name']}",
+                    )
             for p in self._conv_partners:
                 if query.lower() in p.lower():
-                    self.conv_listbox.insert(tk.END, f"  {p}")
+                    iid = f"contact:{p}"
+                    self.conv_tree.insert(self.tree_contacts, "end", iid=iid, text=f"  {p}")
+                    self._contact_tree_ids.append(iid)
         self.root.after(0, _filter)
 
     def _on_search_focus_in(self):
@@ -579,13 +637,8 @@ class ChatWindow:
 
         elif msg_type == TYPE_HISTORY:
             resp_target = msg.get("target", "")
-            # 只渲染当前会话的历史，避免快速切换时显示错乱
-            if resp_target == "public" and self.current_chat == "public":
+            if resp_target == self.current_chat:
                 self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
-            elif resp_target != "public":
-                users = resp_target.split(":")
-                if self.current_chat in users:
-                    self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
 
         elif msg_type == TYPE_GET_USERS:
             self._update_users(msg.get("users", []))
@@ -703,5 +756,6 @@ if __name__ == "__main__":
             login.socket, login.username,
             public_history=getattr(login, '_login_public_history', []),
             conversations=getattr(login, '_login_conversations', []),
+            groups=getattr(login, '_login_groups', []),
         )
         chat.run()
