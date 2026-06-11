@@ -346,9 +346,24 @@ class ChatServer:
             for r in reversed(rows)
         ]
         conversations = self._get_conversations_for_user(username)
+        # 查询用户所在的群
+        gids = self.conn.execute(
+            "SELECT group_id FROM group_members WHERE username=?", (username,)
+        ).fetchall()
+        groups = []
+        for (gid,) in gids:
+            grp = self.conn.execute("SELECT id, name, created_by FROM groups WHERE id=?", (gid,)).fetchone()
+            if grp:
+                mems = self.conn.execute(
+                    "SELECT username FROM group_members WHERE group_id=?", (gid,)
+                ).fetchall()
+                groups.append({
+                    "id": grp[0], "name": grp[1], "created_by": grp[2],
+                    "members": [m[0] for m in mems],
+                })
         login_resp = make_message(
             TYPE_RESPONSE, status=STATUS_OK, message="登录成功",
-            public_history=public_history, conversations=conversations,
+            public_history=public_history, conversations=conversations, groups=groups,
         )
         client_socket.sendall(login_resp.encode(ENCODING))
 
@@ -485,7 +500,7 @@ class ChatServer:
         if not current_user:
             return
         target = msg.get("target", "public")
-        if target != "public":
+        if target != "public" and not target.startswith("group:"):
             target = conversation_key(current_user, target)
         with self.lock:
             rows = self.conn.execute(
