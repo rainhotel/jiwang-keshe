@@ -30,6 +30,18 @@ GRAY = "#999999"
 BLUE_SYSTEM = "#888888"
 FONT_FAMILY = "微软雅黑"
 
+EMOJI_LIST = [
+    "😀", "😂", "🤣", "😅", "😊", "😍",
+    "🤔", "😐", "😢", "😠", "😨", "🤯",
+    "👍", "👎", "👏", "🙏", "💪", "🤝",
+    "❤️", "🔥", "⭐", "🎉", "✨", "💡",
+    "🍔", "🍕", "☕", "🍺", "🎂", "🌈",
+    "🚗", "✈️", "🏠", "🌍", "⏰", "📅",
+    "📎", "🔒", "💻", "📱", "🎵", "📸",
+    "🐱", "🐶", "🎮", "⚽", "🎬", "🎯",
+    "✅", "❌", "⚠️", "🔍", "📝", "💬",
+]
+
 
 # ============================
 #  登录/注册窗口
@@ -320,6 +332,11 @@ class ChatWindow:
                                    command=self.send_message, bg="#2DC100", fg=WHITE,
                                    font=(FONT_FAMILY, 9), relief=tk.FLAT, cursor="hand2")
         self.send_btn.pack(side=tk.RIGHT, padx=(6, 0), ipady=2)
+
+        self.emoji_btn = tk.Button(self.input_frame, text="😀", width=4,
+                                    command=self._show_emoji_panel, bg=BG_COLOR, fg=BLACK,
+                                    font=(FONT_FAMILY, 12), relief=tk.FLAT, cursor="hand2")
+        self.emoji_btn.pack(side=tk.RIGHT, ipady=2)
 
     def _wrap_text(self, text, max_width):
         """将文本按像素宽度换行"""
