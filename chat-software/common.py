@@ -84,3 +84,11 @@ TYPE_LEAVE_GROUP  = "leave_group"
 TYPE_DELETE_GROUP = "delete_group"
 TYPE_GROUP_USERS  = "group_users"
 TYPE_GROUP_MSG    = "group_msg"
+
+# === 文件传输相关常量 ===
+TYPE_FILE_SEND    = "file_send"
+TYPE_FILE_NOTIFY  = "file_notify"
+TYPE_FILE_DOWNLOAD = "file_download"
+
+FILE_PORT = 9998
+FILE_CHUNK = 65536

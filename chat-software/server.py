@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 
 from common import (
     DEFAULT_HOST, DEFAULT_PORT, BUFFER_SIZE, ENCODING,
@@ -17,6 +18,8 @@ from common import (
     TYPE_GET_HISTORY, TYPE_HISTORY,
     TYPE_CREATE_GROUP, TYPE_JOIN_GROUP, TYPE_LEAVE_GROUP,
     TYPE_DELETE_GROUP, TYPE_GROUP_USERS, TYPE_GROUP_MSG,
+    TYPE_FILE_SEND, TYPE_FILE_NOTIFY, TYPE_FILE_DOWNLOAD,
+    FILE_PORT, FILE_CHUNK,
     MAX_HISTORY, MAX_MESSAGES_PER_CHAT,
     STATUS_OK, STATUS_ERROR,
     make_message, parse_message, make_response, make_system_msg,
@@ -86,7 +89,19 @@ class ChatServer:
                 PRIMARY KEY (group_id, username)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id   TEXT PRIMARY KEY,
+                filename  TEXT NOT NULL,
+                size      INTEGER NOT NULL,
+                sender    TEXT NOT NULL,
+                receiver  TEXT NOT NULL,
+                chat_key  TEXT NOT NULL,
+                timestamp TEXT DEFAULT (datetime('now'))
+            )
+        """)
         self.conn.commit()
+        os.makedirs("files", exist_ok=True)
 
     # ========================
     #  用户数据持久化
@@ -140,6 +155,132 @@ class ChatServer:
         return msg
 
     # ========================
+    #  文件传输
+    # ========================
+    def _start_file_server(self):
+        """在 9998 端口处理文件上传/下载"""
+        try:
+            file_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            file_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            file_sock.bind((self.host, FILE_PORT))
+            file_sock.listen(10)
+            file_sock.settimeout(1.0)
+            while True:
+                try:
+                    client, addr = file_sock.accept()
+                    threading.Thread(target=self._handle_file_conn, args=(client, addr), daemon=True).start()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        except Exception as e:
+            print(f"[服务器] 文件端口启动失败: {e}")
+
+    def _handle_file_conn(self, client, addr):
+        """处理文件上传或下载"""
+        try:
+            header = b""
+            while b"\n" not in header:
+                chunk = client.recv(128)
+                if not chunk:
+                    return
+                header += chunk
+            file_id = header.decode(ENCODING).strip()
+
+            filepath = os.path.join("files", file_id)
+            # 文件已上传到磁盘 → 下载模式；否则 → 上传模式
+            if os.path.exists(filepath):
+                with open(filepath, "rb") as f:
+                    while True:
+                        chunk = f.read(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        client.sendall(chunk)
+                print(f"[文件] 下载完成: {filepath} → {addr}")
+            else:
+                # 上传模式
+                received_size = 0
+                with open(filepath, "wb") as f:
+                    while True:
+                        chunk = client.recv(FILE_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received_size += len(chunk)
+                self.conn.execute(
+                    "UPDATE files SET size=? WHERE file_id=?",
+                    (received_size, file_id),
+                )
+                self.conn.commit()
+                print(f"[文件] 上传完成: {filepath} ({received_size} bytes)")
+
+                # 通知接收方
+                row2 = self.conn.execute(
+                    "SELECT receiver, filename, size, sender, chat_key FROM files WHERE file_id=?", (file_id,)
+                ).fetchone()
+                if row2:
+                    receiver, filename, fsize, sender, chat_key = row2
+                    with self.lock:
+                        info = self.clients.get(receiver)
+                        if info and info.get("socket"):
+                            try:
+                                info["socket"].sendall(make_message(
+                                    TYPE_FILE_NOTIFY, file_id=file_id, filename=filename,
+                                    size=fsize, sender=sender,
+                                ).encode(ENCODING))
+                            except Exception:
+                                pass
+        except Exception as e:
+            print(f"[文件] 连接错误: {e}")
+        finally:
+            client.close()
+
+    def _handle_file_send(self, msg, client_socket, current_user):
+        """处理文件发送请求（通过聊天通道）"""
+        if not current_user:
+            return
+        receiver = msg.get("receiver", "").strip()
+        filename = msg.get("filename", "").strip()
+        size = msg.get("size", 0)
+        if not receiver or not filename:
+            client_socket.sendall(
+                make_response(STATUS_ERROR, "参数不完整").encode(ENCODING)
+            )
+            return
+
+        file_id = str(uuid.uuid4())
+        chat_key = conversation_key(current_user, receiver) if receiver != current_user else "public"
+        self.conn.execute(
+            "INSERT INTO files (file_id, filename, size, sender, receiver, chat_key) VALUES (?, ?, ?, ?, ?, ?)",
+            (file_id, filename, size, current_user, receiver, chat_key),
+        )
+        self.conn.commit()
+
+        client_socket.sendall(
+            make_message(TYPE_RESPONSE, status=STATUS_OK, file_id=file_id).encode(ENCODING)
+        )
+        print(f"[文件] {current_user} → {receiver}: {filename} ({size} bytes, id={file_id})")
+
+    def _handle_file_download(self, msg, client_socket, current_user):
+        """处理文件下载请求"""
+        if not current_user:
+            return
+        file_id = msg.get("file_id", "")
+        if not file_id:
+            return
+        row = self.conn.execute(
+            "SELECT file_id, filename FROM files WHERE file_id=?", (file_id,)
+        ).fetchone()
+        if not row:
+            client_socket.sendall(
+                make_response(STATUS_ERROR, "文件不存在").encode(ENCODING)
+            )
+            return
+        client_socket.sendall(
+            make_message(TYPE_RESPONSE, status=STATUS_OK, file_id=file_id).encode(ENCODING)
+        )
+
+    # ========================
     #  服务器启动
     # ========================
     def start(self):
@@ -148,6 +289,9 @@ class ChatServer:
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(50)
         print(f"[服务器] 聊天服务器启动成功：{self.host}:{self.port}")
+        file_thread = threading.Thread(target=self._start_file_server, daemon=True)
+        file_thread.start()
+        print(f"[服务器] 文件传输端口: {self.host}:{FILE_PORT}")
         print("[服务器] 等待客户端连接...")
 
         try:
@@ -250,6 +394,10 @@ class ChatServer:
             self._handle_group_users(msg, client_socket, current_user)
         elif msg_type == TYPE_GROUP_MSG:
             self._handle_group_msg(msg, client_socket, current_user)
+        elif msg_type == TYPE_FILE_SEND:
+            self._handle_file_send(msg, client_socket, current_user)
+        elif msg_type == TYPE_FILE_DOWNLOAD:
+            self._handle_file_download(msg, client_socket, current_user)
         else:
             client_socket.sendall(
                 make_response(STATUS_ERROR, f"未知消息类型: {msg_type}").encode(ENCODING)
