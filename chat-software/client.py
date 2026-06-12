@@ -473,6 +473,14 @@ class ChatWindow:
 
     def _rebuild_conv_list(self):
         def _rebuild():
+            # 记住当前会话，重建后恢复选中
+            cur = self.current_chat
+            target_iid = "public"
+            if cur.startswith("group:"):
+                target_iid = cur
+            elif cur != "public":
+                target_iid = f"contact:{cur}"
+
             # 清空联系人和群子节点
             for iid in self._contact_tree_ids:
                 self.conv_tree.delete(iid)
@@ -495,6 +503,10 @@ class ChatWindow:
                 iid = f"contact:{p}"
                 tree.insert(self.tree_contacts, "end", iid=iid, text=f"  {prefix}{p}")
                 self._contact_tree_ids.append(iid)
+
+            # 恢复选中
+            if tree.exists(target_iid):
+                tree.selection_set(target_iid)
         self.root.after(0, _rebuild)
 
     def _render_history(self, messages):
@@ -828,7 +840,7 @@ class ChatWindow:
 
         elif msg_type == TYPE_HISTORY:
             resp_target = msg.get("target", "")
-            if resp_target == self.current_chat:
+            if resp_target == self.current_chat or resp_target == conversation_key(self.username, self.current_chat):
                 self.root.after(0, lambda m=msg: self._render_history(m.get("messages", [])))
 
         elif msg_type == TYPE_GET_USERS:
@@ -1266,6 +1278,17 @@ class ChatWindow:
             gid = int(self.current_chat.split(":")[1])
             ts = datetime.now(timezone.utc).isoformat()
             msg = make_message(TYPE_GROUP_MSG, group_id=gid, content=content, timestamp=ts)
+            try:
+                self.socket.sendall(msg.encode(ENCODING))
+            except Exception as e:
+                self._add_bubble("[系统]", f"发送失败: {e}", "")
+            return
+
+        # 私聊（当前选中的是联系人）
+        if self.current_chat != "public":
+            ts = datetime.now(timezone.utc).isoformat()
+            msg = make_message(TYPE_PRIVATE, target=self.current_chat, content=content,
+                               timestamp=ts)
             try:
                 self.socket.sendall(msg.encode(ENCODING))
             except Exception as e:
